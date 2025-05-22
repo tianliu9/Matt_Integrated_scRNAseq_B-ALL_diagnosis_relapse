@@ -1,0 +1,3542 @@
+---
+title: "2024_05_31_Github_scFEA"
+output: html_document
+date: "2024_05_31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import Libraries
+================
+
+```{r}
+set.seed(202410)
+
+script.date = "2024_05_31"
+
+folder.name = "2024_05_31_Github_scFEA"
+save_point = paste0(folder.name, "/SAVE_POINT")
+
+if(!exists(folder.name)){
+  dir.create(folder.name, recursive = TRUE)
+}
+
+library(Seurat) # V4 Because old object is Seurat V4
+library(SeuratObject)
+library(readr)
+library(dplyr) 
+library(ggplot2)
+library(tidyverse)
+library(symphony)
+library(ggpubr)
+library(patchwork)
+library(BoneMarrowMap)
+# library(SeuratWrappers)
+library(SingleCellExperiment)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(dittoSeq)
+library(plotly)
+library(htmlwidgets)
+library(msigdbr)
+library(fgsea)
+library(Rcpp)
+library(harmony)
+library(openxlsx)
+library(readxl)
+library(stringr)
+library(clustree)
+library(reshape2)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db) 
+library(DOSE)
+library(escape)
+library(scran)
+
+# Rise memory
+options(future.globals.maxSize = 14000 * 1024^2) ## 14 GB (I think ...)
+```
+
+# 1. Intergrated Data
+
+## Task 1.1 Merge Two Seurat Object
+
+### Task 1.1.1 Load inferCNV and Loser Project
+
+```{r}
+# Load the saved Combine Seurat object, which only contain tumor cells of Diagnosis and Relapse samples
+Combined.Object <- readRDS(paste0("./2023_10_19_Witkowski_Integrated_scRNAseq_B-ALL_diagnosis_relapse/Combined.Object.rds"))
+
+# inferCNV.subset.Object <- readRDS(paste0("./2023_10_19_Witkowski_Integrated_scRNAseq_B-ALL_diagnosis_relapse/inferCNV.subset.object.rds"))
+# 
+# Loser.subset.Object <- readRDS(paste0("./2023_10_19_Witkowski_Integrated_scRNAseq_B-ALL_diagnosis_relapse/Loser.subset.object.rds"))
+```
+
+```{r}
+Combined.Object@meta.data
+```
+
+```{r}
+table(Combined.Object@meta.data$predicted.id, Combined.Object@meta.data$new_labels)
+```
+
+```{r}
+Combined.Object@meta.data <- Combined.Object@meta.data[, 1:8]
+Combined.Object@meta.data
+```
+
+```{r}
+# Combined.Object@assays
+# Combined.Object@meta.data
+Combined.Object@meta.data %>% dplyr::count(new_labels)
+```
+
+### Task 1.1.2 Load NYU Two New Samples
+
+```{r}
+# List of sample names
+sample_names <- c(
+  "Diagnosis_SAV_1", # Patient1
+  "Diagnosis_SAV_2", # Patient1
+  "Relapse_SAV_1", # Patient1
+  "Relapse_SAV_2" # Patient1
+  # "Diagnosis_HAZ_1", # Patient2
+  # "Diagnosis_HAZ_2", # Patient2
+  # "Relapse_HAZ_1", # Patient2
+  # "Relapse_HAZ_2" # Patient2
+)
+
+# Create Seurat objects for the first dataset separately
+first_sample <- sample_names[1]
+first_file_path <- paste0("2024_09_28_NYU_new_samples_Patient1_2/Patient_12/cellranger_multi_res/", first_sample, "/sample_filtered_feature_bc_matrix.h5")
+first_data <- Read10X_h5(filename = first_file_path)
+first_seurat_obj <- CreateSeuratObject(counts = first_data$`Gene Expression`, project = first_sample)
+first_seurat_obj[['CMO']] = CreateAssayObject(counts = first_data$`Multiplexing Capture`)
+
+
+# Create Seurat objects for the rest of the datasets
+other_samples <- sample_names[-1]
+seurat_objects <- list(first_seurat_obj)
+
+# Loop through each other dataset name
+for (sample_name in other_samples) {
+  # Construct the file path
+  file_path <- paste0("2024_09_28_NYU_new_samples_Patient1_2/Patient_12/cellranger_multi_res/", sample_name, "/sample_filtered_feature_bc_matrix.h5")
+  
+  # Read the data
+  data <- Read10X_h5(filename = file_path)
+  
+  # Create a Seurat object
+  seurat_obj <- CreateSeuratObject(counts = data$`Gene Expression`, project = sample_name)
+  seurat_obj[['CMO']] = CreateAssayObject(counts = data$`Multiplexing Capture`)
+  
+  # Store the Seurat object in the list
+  seurat_objects[[sample_name]] <- seurat_obj
+}
+
+# Merge the Seurat objects
+NYU_two_new_samples.Object <- merge(x = first_seurat_obj, y = seurat_objects[-1], add.cell.id = sample_names)
+```
+
+```{r}
+NYU_two_new_samples.Object@assays
+```
+
+```{r}
+NYU_two_new_samples.Object@meta.data
+```
+
+```{r}
+## Add Metadata
+
+### Compute Num of gene per UMI
+
+NYU_two_new_samples.Object$log10GenePerUMI = log10(NYU_two_new_samples.Object$nFeature_RNA) / log10(NYU_two_new_samples.Object$nCount_RNA)
+```
+
+```{r}
+### Compute Percent mito ratio
+
+NYU_two_new_samples.Object$mitoPct = PercentageFeatureSet(NYU_two_new_samples.Object, pattern = "^MT-")
+NYU_two_new_samples.Object$mitoRatio = NYU_two_new_samples.Object@meta.data$mitoPct / 100
+```
+
+```{r}
+NYU_two_new_samples.Object@meta.data
+```
+
+```{r}
+# Define the mapping between old labels and new labels
+mapping <- c(
+  "Diagnosis_SAV_1" = "Patient1_D",
+  "Diagnosis_SAV_2" = "Patient1_D",
+  "Relapse_SAV_1" = "Patient1_R",
+  "Relapse_SAV_2" = "Patient1_R"
+  # "Diagnosis_HAZ_1" = "Patient2_D",
+  # "Diagnosis_HAZ_2" = "Patient2_D",
+  # "Relapse_HAZ_1" = "Patient2_R",
+  # "Relapse_HAZ_2" = "Patient2_R"
+)
+
+# Apply the mapping to create the new_labels column in NYU_two_new_samples.Object@meta.data
+NYU_two_new_samples.Object@meta.data$new_labels <- mapping[NYU_two_new_samples.Object@meta.data$orig.ident]
+
+# Move new_labels column right after orig.ident
+NYU_two_new_samples.Object@meta.data <- NYU_two_new_samples.Object@meta.data[, c(1, ncol(NYU_two_new_samples.Object@meta.data), 2:(ncol(NYU_two_new_samples.Object@meta.data)-1))]
+
+# Check for unmapped values in NYU_two_new_samples.Object@meta.data
+unmapped <- is.na(NYU_two_new_samples.Object@meta.data$new_labels)
+if (any(unmapped)) {
+  cat("The following orig.ident values have no mapping and are set to NA:\n")
+  cat(paste(NYU_two_new_samples.Object@meta.data$orig.ident[unmapped], collapse = "\n"))
+  # Optionally set a default value for unmapped entries
+  # NYU_two_new_samples.Object@meta.data$new_labels[unmapped] <- "DefaultValue"
+}
+
+NYU_two_new_samples.Object@meta.data
+```
+
+```{r}
+# Run PCA
+# Use standard normalization
+
+DefaultAssay(NYU_two_new_samples.Object) <- 'RNA'
+NYU_two_new_samples.Object <- NormalizeData(NYU_two_new_samples.Object) %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA()
+```
+
+```{r}
+getReductions(NYU_two_new_samples.Object)
+```
+
+# SAVE POINT
+
+```{r}
+save_point = paste0(folder.name, "/SAVE_POINT")
+
+if(!exists(save_point)){
+  dir.create(save_point, recursive = TRUE)
+}
+```
+
+```{r}
+# saveRDS(NYU_two_new_samples.Object, file = paste0(save_point, "/NYU_two_new_samples.Object.SeuratV4_with_pca_only_Patient1.rds"))
+```
+
+```{r}
+# NYU_two_new_samples.Object <- readRDS(paste0(save_point, "/NYU_two_new_samples.Object.SeuratV4_with_pca_only_Patient1.rds"))
+```
+
+### Task 1.1.3 Cell Anchoring
+
+```{r}
+# Use this object as a reference
+
+inferCNV.Object <- readRDS("/Users/ltian/Desktop/Project_CU/2023_10_19_Witkowski_Integrated_scRNAseq_B-ALL_diagnosis_relapse/2023_10_19_Witkowski_Integrated_scRNAseq_B-ALL_diagnosis_relapse/inferCNV.Object.rds")
+
+# load(file = "Matt.object.Rdata")
+# table(Matt.Object@meta.data$predicted.id)
+```
+
+```{r}
+table(inferCNV.Object@meta.data$predicted.id)
+#     CD14 Mono      CD16 Mono     CD4 Memory      CD4 Naive CD56 bright NK CD8 Effector_1 
+#            514             82            587           1365              5              1 
+# CD8 Effector_2   CD8 Memory_2      CD8 Naive           cDC2            GMP            HSC 
+#            180             47            428             84            168            211 
+#           LMPP           MAIT       Memory B        Naive B             NK            pDC 
+#             39              1            739            377            193          26411 
+#    Plasmablast       Prog_B 1       Prog_B 2        Prog_DC        Prog_Mk       Prog_RBC 
+#          10916           9849          11209             56             43           1243 
+```
+
+```{r}
+DefaultAssay(NYU_two_new_samples.Object) <- "RNA"
+
+# transfer cell type labels from reference to query
+transfer_anchors <- FindTransferAnchors(
+  reference = inferCNV.Object,
+  query = NYU_two_new_samples.Object,
+  normalization.method = "LogNormalize",
+  reference.reduction = "pca",
+  recompute.residuals = FALSE,
+  dims = 1:50
+)
+```
+
+```{r}
+predictions <- TransferData(
+  anchorset = transfer_anchors, 
+  refdata = inferCNV.Object$predicted.id,
+  weight.reduction = NYU_two_new_samples.Object[['pca']], ## using query data
+  dims = 1:50
+)
+```
+
+```{r}
+NYU_two_new_samples.Object <- AddMetaData(
+  object = NYU_two_new_samples.Object,
+  metadata = predictions
+)
+```
+
+```{r}
+NYU_two_new_samples.Object@meta.data
+```
+
+```{r}
+table(NYU_two_new_samples.Object@meta.data$predicted.id)
+```
+
+# SAVE POINT
+
+```{r}
+# saveRDS(NYU_two_new_samples.Object, file = paste0(save_point, "/NYU_two_new_samples.Object.SeuratV4_with_predictedID_only_Patient1.rds"))
+```
+
+```{r}
+# NYU_two_new_samples.Object <- readRDS(paste0(save_point, "/NYU_two_new_samples.Object.SeuratV4_with_predictedID_only_Patient1.rds"))
+```
+
+### Task 1.1.4 Extract Tumor Cells
+
+```{r}
+table(NYU_two_new_samples.Object@meta.data$predicted.id)
+```
+
+```{r}
+# First run inferCNV on Patient_1_Diagnosis, Patient_1_Relapse, Patient_2_Diagnosis, Patient_2_Relapse
+# For Patient1_D, rename: PH003_D, tumor cells: ProgB1 and ProgB2
+# For Patient1_R, rename: PH003_R, tumor cells: ProgB1 and ProgB2
+# For Patient2_D, rename: Other001_D, tumor cells: ProgB1 and ProgB2 (Removed)
+# For Patient2_D, rename: Other001_R, tumor cells: ProgB1 and ProgB2 (Removed)
+```
+
+```{r}
+NYU_two_new_samples.Object@meta.data
+```
+
+```{r}
+table(NYU_two_new_samples.Object@meta.data$new_labels)
+```
+
+```{r}
+# Change the labels
+NYU_two_new_samples.Object@meta.data$new_labels <- case_when(
+  NYU_two_new_samples.Object@meta.data$new_labels == "Patient1_D" ~ "PH003_D",
+  NYU_two_new_samples.Object@meta.data$new_labels == "Patient1_R" ~ "PH003_R",
+  # NYU_two_new_samples.Object@meta.data$new_labels == "Patient2_D" ~ "Other001_D",
+  # NYU_two_new_samples.Object@meta.data$new_labels == "Patient2_R" ~ "Other001_R",
+  TRUE ~ NYU_two_new_samples.Object@meta.data$new_labels  # Keep other labels unchanged
+)
+```
+
+```{r}
+NYU_two_new_samples.Object@meta.data
+# table(NYU_two_new_samples.Object@meta.data$new_labels)
+```
+
+```{r}
+# NYU_two_new_samples.Object
+condition_1 <- NYU_two_new_samples.Object@meta.data$new_labels %in% c("PH003_D", "PH003_R", "Other001_D", "Other001_R") & 
+               (NYU_two_new_samples.Object@meta.data$predicted.id %in% c("Prog_B 1", "Prog_B 2"))
+
+# Get the names of the cells that meet the condition
+cells_to_keep <- rownames(NYU_two_new_samples.Object@meta.data[condition_1, ])
+
+# Subset the Seurat object
+NYU_two_new_samples.Object <- subset(NYU_two_new_samples.Object, cells = cells_to_keep)
+```
+
+```{r}
+NYU_two_new_samples.Object@meta.data
+```
+
+```{r}
+table(NYU_two_new_samples.Object@meta.data$new_labels)
+# PH003_D PH003_R 
+#     987    1525 
+```
+
+### Task 1.1.5 Merge Seurat Objects
+
+```{r}
+### Harmonize Metadata Columns
+Combined.Object@meta.data <- Combined.Object@meta.data %>% 
+  select(-starts_with("prediction.score"))
+  
+combined_colnames <- colnames(Combined.Object@meta.data)
+combined_colnames
+```
+
+```{r}
+NYU_two_new_samples.Object@meta.data <- NYU_two_new_samples.Object@meta.data %>% 
+  select(-starts_with("prediction.score"))
+
+NYU_new_colnames <- colnames(NYU_two_new_samples.Object@meta.data)
+NYU_new_colnames
+```
+
+```{r}
+# Match NYU_two_new_samples.Object metadata to Combined.Object
+# drop = FALSE keeps the output as a data frame not a vector
+NYU_two_new_samples.Object@meta.data <- NYU_two_new_samples.Object@meta.data[, combined_colnames, drop = FALSE]
+```
+
+```{r}
+colnames(NYU_two_new_samples.Object@meta.data)
+```
+
+```{r}
+###Ensure Same Gene Set
+
+
+# Find common genes
+common_genes <- intersect(rownames(NYU_two_new_samples.Object), rownames(Combined.Object))
+
+# Subset both Seurat objects to common genes
+Combined.subset.object <- subset(Combined.Object, features = common_genes)
+NYU_two_new_samples.subset.object <- subset(NYU_two_new_samples.Object, features = common_genes)
+```
+
+```{r}
+Combined.subset.object@assays
+Combined.subset.object@meta.data
+```
+
+```{r}
+NYU_two_new_samples.subset.object@assays
+NYU_two_new_samples.subset.object@meta.data
+```
+
+```{r}
+# Merge the two Seurat objects
+Combined.New.Object <- merge(Combined.subset.object, y = NYU_two_new_samples.subset.object)
+```
+
+```{r}
+Combined.New.Object@assays
+```
+
+```{r}
+Combined.New.Object@meta.data
+# table(Combined.New.Object@meta.data$new_labels)
+# ETV001_D ETV001_R ETV002_D ETV002_R ETV003_D ETV003_R ETV004_D ETV004_R ETV005_D ETV005_R  LH001_D 
+#     5119      606     1085     1487      902      570      996      368      957      699     2043 
+#  LH001_R  LH002_D  LH002_R  LH003_D  LH003_R  NH001_D  NH001_R  NH002_D  NH002_R  NH003_D  NH003_R 
+#     5497     2582     1896     3286     5112     3211      575      913     1183     3524     4172 
+#  NH004_D  NH004_R  NH005_D  NH005_R  NH006_D  NH006_R  NH007_D  NH007_R  NH008_D  NH008_R  PH001_D 
+#     2916     1469     4533     4422     2450      132     1389      839     1884      390      767 
+#  PH001_R  PH002_D  PH002_R  PH003_D  PH003_R 
+#      803      734      817      987     1525
+```
+
+# SAVE POINT
+
+```{r}
+# saveRDS(Combined.New.Object, file = paste0(save_point, "/Combined.New.Object.SeuratV4_only_Patient1.rds"))
+```
+
+```{r}
+# Combined.New.Object <- readRDS(paste0(save_point, "/Combined.New.Object.SeuratV4_only_Patient1.rds"))
+```
+
+# 2. Cell Type Anchoring
+
+## Task 2.1 Top 100 Marker Genes
+
+```{r}
+# Load the CSV file containing the marker genes
+top100_markers <- read_csv(paste0(folder.name, "/Andy_b_cell_development/ST13_BALL_DevState_Top100_MarkerGenes.csv"))
+```
+
+```{r}
+# Prepare lists of marker genes for each cell type
+markers.HSC_MPP <- na.omit(as.character(top100_markers$HSC_MPP))
+markers.Myeloid_Prog <- na.omit(as.character(top100_markers$Myeloid_Prog))
+markers.Pre_pDC <- na.omit(as.character(top100_markers$Pre_pDC))
+markers.Early_Lymphoid <- na.omit(as.character(top100_markers$Early_Lymphoid))
+markers.Pro_B <- na.omit(as.character(top100_markers$Pro_B))
+markers.Pre_B <- na.omit(as.character(top100_markers$Pre_B))
+
+# Create a list of these gene lists
+gene.lists <- list(
+  HSC_MPP = markers.HSC_MPP,
+  Myeloid_Prog = markers.Myeloid_Prog,
+  Pre_pDC = markers.Pre_pDC,
+  Early_Lymphoid = markers.Early_Lymphoid,
+  Pro_B = markers.Pro_B,
+  Pre_B = markers.Pre_B
+)
+```
+
+## Task 2.2 Calculate Scores
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+```{r}
+set.seed(202410) # Set a random seed for reproducibility
+
+# Need to use Seurat V4 Object
+for (cell_type in names(gene.lists)) {
+  Combined.New.Object <- AddModuleScore(object = Combined.New.Object, features = list(gene.lists[[cell_type]]), name = paste0(cell_type, "_score"))
+}
+```
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+```{r}
+# Extract scores into a data frame
+scores.data <- FetchData(Combined.New.Object, vars = paste0(names(gene.lists), "_score1"))
+
+# Remove the '_score1' from each cell type name in the dataframe
+names(scores.data) <- gsub("_score1", "", names(scores.data))
+
+# Determine the dominant cell type for each cell
+scores.data$dominant_cell_type <- apply(scores.data, 1, function(x) names(x)[which.max(x)])
+
+# Add this information to metadata
+Combined.New.Object$dominant_cell_type <- scores.data$dominant_cell_type
+
+# Put the column ahead predicted.id
+Combined.New.Object@meta.data <- Combined.New.Object@meta.data %>%
+  relocate(dominant_cell_type, .after = 7)
+```
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+```{r}
+Combined.New.Object@meta.data %>%
+    dplyr::count(dominant_cell_type)
+```
+
+# SAVE POINT
+
+```{r}
+# saveRDS(Combined.New.Object, file = paste0(save_point, "/Combined.New.Object.SeuratV4_with_Andy_cell_type_only_Patient1.rds"))
+```
+
+```{r}
+# Combined.New.Object <- readRDS(paste0(save_point, "/Combined.New.Object.SeuratV4_with_Andy_cell_type_only_Patient1.rds"))
+```
+
+# 3. UMAP
+
+```{r}
+Task3_UMAP = paste0(folder.name, "/Task3_UMAP")
+
+if(!exists(Task3_UMAP)){
+  dir.create(Task3_UMAP, recursive = TRUE)
+}
+
+Task3.1_Combined_UMAP = paste0(Task3_UMAP, "/Task3.1_Combined_UMAP")
+
+if(!exists(Task3.1_Combined_UMAP)){
+  dir.create(Task3.1_Combined_UMAP, recursive = TRUE)
+}
+```
+
+## Task 3.1 Combined UMAP
+
+```{r}
+## PCA
+
+# Use standard normalization
+DefaultAssay(Combined.New.Object) <- 'RNA'
+Combined.New.Object <- NormalizeData(Combined.New.Object) %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA()
+```
+
+```{r}
+# Determine percent of variation associated with each PC
+pct <- Combined.New.Object[["pca"]]@stdev / sum(Combined.New.Object[["pca"]]@stdev) * 100
+# pct
+
+# Calculate cumulative percents for each PC
+cumu <- cumsum(pct)
+# cumu
+
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5
+co1 <- which(cumu > 90 & pct < 5)[1]
+co1
+```
+
+```{r}
+# Identifies the PC where the percent change in variation between consecutive PCs is less than 0.1%
+co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+co2
+```
+
+```{r}
+# Choose the minimum of these two metrics as the PCs covering the majority of the variation in the data.
+pcs <- min(co1, co2)
+pcs
+```
+
+```{r}
+plot_df <- data.frame(pct = pct,
+                      cumu = cumu,
+                      rank = 1:length(pct))
+
+plot_df
+
+ggplot(plot_df, aes(cumu, pct, label = rank, color = rank > pcs)) +
+  geom_text() +
+  # geom_vline(xintercept = 75, color = "grey") +
+  # geom_hline(yintercept = min(pct[pct > 5]), color = "grey") +
+  theme_bw()
+
+```
+
+```{r}
+# Run Harmony to correct for batch effects in the PCA space (default - So must have PCA computed)
+Combined.New.Object <- RunHarmony(Combined.New.Object, group.by.vars = "new_labels")
+```
+
+```{r}
+## RunUMAP
+
+Combined.New.Object <- Combined.New.Object %>%
+  FindNeighbors(., dims = 1:pcs) %>%
+  # Enable method = "igraph" to avoid casting large data to a dense matrix.
+  FindClusters(., method = "igraph") %>%
+  RunUMAP(.,
+          dims = 1:40,
+          # dims = 1:pcs,
+          reduction = "harmony",
+          n.components = 3L)
+``` 
+
+```{r}
+Combined.New.Object@meta.data %>%
+    dplyr::count(dominant_cell_type)
+```
+
+```{r}
+num_unique_labels <- Combined.New.Object@meta.data %>%
+    summarize(num_labels = n_distinct(dominant_cell_type)) %>%
+    pull(num_labels)
+
+print(num_unique_labels)
+```
+
+```{r}
+### Generate Distinct Colors
+
+sample_colors <- c( 
+  "#00B7FF",
+  "deeppink1",
+  "#4DAF4A",
+  "#7570B3",
+  "#FF7F00","gold1"
+)
+sample_labels <- levels(as.factor(Combined.New.Object@meta.data$dominant_cell_type))
+sample_colors <- setNames(sample_colors, sample_labels)
+```
+
+```{r}
+### 2D Plot
+
+plot <- dittoDimPlot(Combined.New.Object,
+             var = "dominant_cell_type",
+             color.panel = sample_colors,  # Use our custom colors
+             size = 0.4,
+             # legend.show = FALSE,
+             legend.size = 5,
+             do.label = TRUE,
+             opacity = 0.5,
+             labels.size = 1.5,
+             raster=FALSE,
+             reduction.use = "umap",
+             xlab = "UMAP 1",
+             ylab = "UMAP 2",
+             main = "UMAP for All Samples"
+             )
+
+# Modify the plot to change legend text size
+plot <- plot + theme(legend.position = "bottom",
+                     legend.text = element_text(size = 8),
+                     legend.spacing.x = unit(1, 'cm'), # Adjust spacing
+                     legend.spacing.y = unit(1, 'cm')) 
+
+plot
+ggsave(filename = paste0(Task3.1_Combined_UMAP, "/2D_UMAP_with_dominant_cell_type_harmony.pdf"),
+       plot = plot,
+       width = 12,
+       height = 10)
+```
+
+```{r}
+### Interactive Plot
+
+
+# Extract UMAP data
+umap_data <- Embeddings(Combined.New.Object, reduction = "umap")
+# Extract metadata for hover information
+umap_metadata <- FetchData(Combined.New.Object, vars = c("dominant_cell_type", "new_labels"))
+# Combine UMAP data with metadata
+umap_plot_data <- cbind(umap_data, umap_metadata)
+
+umap_plot_data$dominant_cell_type <- as.factor(umap_plot_data$dominant_cell_type)
+umap_plot_data$new_labels <- as.factor(umap_plot_data$new_labels)
+umap_plot_data_df <- as.data.frame(umap_plot_data)
+```
+
+```{r}
+# Create an interactive plot
+fig <- plot_ly(umap_plot_data_df, 
+               x = ~UMAP_1, 
+               y = ~UMAP_2, 
+               type = 'scatter', 
+               mode = 'markers',
+               color = ~dominant_cell_type,
+               colors = sample_colors,
+               marker = list(size = 3, opacity = 0.5),      
+               text = ~paste("Cell Type:", dominant_cell_type, "<br>New Label:", new_labels),
+               hoverinfo = 'text')
+
+# Customize the layout
+fig <- fig %>% layout(title = 'Interactive UMAP Plot',
+                      xaxis = list(title = 'UMAP 1'),
+                      yaxis = list(title = 'UMAP 2'),
+                      legend = list(font = list(size = 12)))
+
+saveWidget(fig, file = paste0(Task3.1_Combined_UMAP, "/Interactive_UMAP_with_dominant_cell_type_harmony.html"))
+```
+
+```{r}
+### 3D Plot
+
+
+# Embeddings(object = Combined.Object, reduction = "umap")
+
+UMAP.3D <-
+  plot_ly(data = umap_plot_data_df,
+    x = ~UMAP_1,
+    y = ~UMAP_2,
+    z = ~UMAP_3,
+    color = ~dominant_cell_type,
+    colors = sample_colors,
+    type="scatter3d",
+    mode="markers+text",
+    marker = list(
+    size = 2,  # Slightly larger markers
+    opacity = 0.5  # Some transparency
+  )
+)
+
+htmlwidgets::saveWidget(
+  widget = UMAP.3D,
+  file = paste0(Task3.1_Combined_UMAP, "/3D_UMAP_with_dominant_cell_type_harmony", ".html"),
+  selfcontained = T,
+  title = "3D UMAP"
+)
+```
+
+# SAVE POINT
+
+```{r}
+# saveRDS(Combined.New.Object, file = paste0(save_point, "/Combined.New.Object.SeuratV4_with_Andy_cell_type_with_reduction_only_Patient1.rds"))
+```
+
+```{r}
+Combined.New.Object <- readRDS(paste0(save_point, "/Combined.New.Object.SeuratV4_with_Andy_cell_type_with_reduction_only_Patient1.rds"))
+
+# V5.Combined.New.Object <- readRDS(paste0(save_point, "/Combined.New.Object.Seurat_with_Andy_cell_type_with_reduction_V5.rds"))
+```
+
+## Task 3.2 Split UMAP for each sample
+
+```{r}
+Task3.2_UMAP_for_each_sample = paste0(Task3_UMAP, "/Task3.2_UMAP_for_each_sample")
+
+if(!exists(Task3.2_UMAP_for_each_sample)){
+  dir.create(Task3.2_UMAP_for_each_sample, recursive = TRUE)
+}
+```
+
+```{r}
+unique_labels <- unique(Combined.New.Object@meta.data$new_labels)
+
+# # Store plot objects in a list
+# plot_list <- list()
+
+for (label in unique_labels) {
+  # Extract data for plotting
+  data <- FetchData(Combined.New.Object, vars = c("UMAP_1", "UMAP_2", "new_labels"))
+
+  # Define the highlight condition directly in the data frame
+  data$highlight <- ifelse(data$new_labels == label, 'highlighted', 'other')
+
+  # Start a ggplot
+  p <- ggplot(data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(data = data[data$highlight == "other", ], aes(color = highlight), alpha = 0.5, size = 0.2) +
+    geom_point(data = data[data$highlight == "highlighted", ], aes(color = highlight), size = 0.2) +
+    scale_color_manual(values = c("other" = "grey", "highlighted" = "red")) +
+    ggtitle(paste("UMAP Plot for", label)) +
+    theme_minimal()
+
+  pdf_filename <- paste0(Task3.2_UMAP_for_each_sample, "/UMAP_highlight_", label, ".pdf")
+  
+  pdf(pdf_filename, width = 8, height = 6)
+  print(p)
+  dev.off()
+  
+  # plot_list[[label]] <- p
+}
+
+# # Assuming 4x6 grid for 23 plots
+# combined_plot <- wrap_plots(plot_list, ncol = 4)
+# ggsave(filename = paste0(Task3.2_UMAP_for_each_sample, "/combined_UMAP.pdf"), 
+#        plot = combined_plot, width = 30, height = 20)
+```
+
+## Task 3.3 FindClusters with Different Resolution
+
+```{r}
+# Identify clusters of cells by a shared nearest neighbor (SNN) modularity optimization based clustering algorithm. First calculate k-nearest neighbors and construct the SNN graph.
+
+Task3.3_UMAP_by_SNN <- paste0(Task3_UMAP, "/Task3.3_UMAP_by_SNN_dominant_cell_type")
+if(!dir.exists(Task3.3_UMAP_by_SNN)) {
+  dir.create(Task3.3_UMAP_by_SNN, recursive = TRUE)
+}
+```
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+```{r}
+Combined.New.Object@meta.data <- Combined.New.Object@meta.data[, !colnames(Combined.New.Object@meta.data) %in% c("RNA_snn_res.0.8", "seurat_clusters")]
+Combined.New.Object@meta.data
+```
+
+```{r}
+# Matt: 0.05 is the best!!!!
+# Define the sequence of resolution values
+resolutions <- 0.05
+# resolutions <- seq(0.01, 0.03, by = 0.01)
+
+# Loop through each resolution value
+for(resolution_value in resolutions) {
+  cat("Processing resolution:", resolution_value, "\n")
+  
+  # Update the Seurat object with the current resolution
+  Combined.New.Object <- Combined.New.Object %>%
+    FindNeighbors(., dims = 1:13) %>% # pcs = 13
+    FindClusters(method = "igraph", resolution = resolution_value) %>%
+    RunUMAP(dims = 1:40, reduction = "harmony", n.components = 3L)
+  
+  # Save the clusters for each resolution in the metadata
+  resolution_col_name <- paste0("RNA_snn_res.", as.character(resolution_value))
+  # print(resolution_col_name)
+  Combined.New.Object[[resolution_col_name]]  <- Combined.New.Object$seurat_clusters
+
+  # Generate the UMAP plot for the current resolution
+  umap_plot <- DimPlot(Combined.New.Object,
+                       reduction = "umap",
+                       label = TRUE) +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.spacing.x = unit(1.5, 'cm'), # Adjust spacing
+          legend.spacing.y = unit(1.5, 'cm'))
+  
+  # Define the filename using the current resolution value
+  filename <- paste0(Task3.3_UMAP_by_SNN, "/UMAP_resolution_", resolution_value, ".pdf")
+  # Save the UMAP plot as a PDF
+  ggsave(filename,
+         plot = umap_plot,
+         width = 10,
+         height = 8)
+}
+```
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+## Task 3.4 Clustree Package
+
+```{r}
+Task3.4_Clustree <- paste0(Task3_UMAP, "/Task3.4_Clustree")
+if(!dir.exists(Task3.4_Clustree)) {
+  dir.create(Task3.4_Clustree, recursive = TRUE)
+}
+```
+
+```{r}
+# Dendrogram or hierarchical tree
+for(resolution_value in resolutions) {
+  Idents(Combined.New.Object) <- paste0("RNA_snn_res.", resolution_value)
+  # Build the cluster tree
+  cluster_tree <- BuildClusterTree(Combined.New.Object)
+  # Save the plot
+  cluster_tree_filename <- file.path(Task3.4_Clustree, paste0("ClusterTree_Dendrogram_resolution_", resolution_value, ".pdf"))
+  pdf(cluster_tree_filename, width = 10, height = 8)
+  PlotClusterTree(cluster_tree)
+  dev.off()
+}
+```
+
+```{r}
+# Network-like tree across resolutions: Shows clustering stability/changes across resolutions
+
+clustree_filename <- file.path(Task3.4_Clustree, paste0("Clustree_Network_resolution_", resolution_value, ".pdf"))
+pdf(clustree_filename, width = 25, height = 20)
+clustree(Combined.New.Object, prefix = "RNA_snn_res.")
+dev.off()
+
+# # Other Method:
+# clustree_plot <- FindClusters(Combined.New.Object, resolution = resolution_value, verbose = FALSE)
+# clustree_filename <- file.path(Task3.4_Clustree, paste0("Clustree_Network_resolution_", resolution_value, ".pdf"))
+# pdf(clustree_filename, width = 25, height = 20)
+# clustree(clustree_plot)
+# dev.off()
+```
+
+## Task 3.5 Find All Markers
+
+```{r}
+Task3.5_Markers <- paste0(Task3_UMAP, "/Task3.5_Markers")
+if(!dir.exists(Task3.5_Markers)) {
+  dir.create(Task3.5_Markers, recursive = TRUE)
+}
+```
+
+```{r}
+# resolutions <- seq(0.01, 0.03, by = 0.01)
+resolutions <- 0.05
+markers_list <- list()
+
+for(resolution_value in resolutions) {
+  diff_resolution <- paste0("RNA_snn_res.", resolution_value)
+  
+  DefaultAssay(Combined.New.Object) <- "RNA"
+  
+  Idents(Combined.New.Object) <- diff_resolution
+  
+  markers = Combined.New.Object %>%
+    FindAllMarkers(.,
+      # identify genes that are uniquely or predominantly expressed in each cluster compared to others
+      only.pos = T,
+      min.pct = 0.25, # Minimum percentage of cells expressing the gene
+      logfc.threshold = 0.25 # Log-fold change threshold
+    )
+  
+  # Store markers as a data frame in the list with the resolution name
+  markers_list[[diff_resolution]] <- markers
+}
+```
+
+```{r}
+for (resolution_name in names(markers_list)) {
+  
+  file_name <- paste0(Task3.5_Markers, "/", resolution_name, "_markers.csv")
+  
+  markers_df <- markers_list[[resolution_name]]
+  
+  write.csv(markers_df, file = file_name, row.names = FALSE)
+}
+```
+
+## Task 3.6 Heatmap
+
+```{r}
+Task3.6_Heatmap <- paste0(Task3_UMAP, "/Task3.6_Heatmap")
+if(!dir.exists(Task3.6_Heatmap)) {
+  dir.create(Task3.6_Heatmap, recursive = TRUE)
+}
+```
+
+```{r}
+# Average each gene in each cluster:
+
+for(resolution_value in resolutions) {
+  
+  diff_resolution <- paste0("RNA_snn_res.", resolution_value)
+  
+  # Get the top marker genes for the given resolution
+  markers_df <- markers_list[[diff_resolution]]
+  
+  # Select top 10 marker genes per cluster based on avg_log2FC
+  top_markers <- markers_df %>%
+    group_by(cluster) %>%
+    top_n(10, avg_log2FC)
+  
+  # Extract the top marker genes
+  top_genes <- unique(top_markers$gene)
+  
+  # Calculate average expression of selected top genes for each cluster
+  avg_expr <- AverageExpression(
+    Combined.New.Object,
+    features = top_genes,
+    group.by = diff_resolution,
+    slot = "data"  # Use the "data" slot to get log-normalized values
+  )$RNA
+  
+  # Subset the average expression matrix to only include selected top genes
+  avg_expr_subset <- avg_expr[top_genes, ]
+  
+  # Generate the heatmap
+  heatmap_plot <- pheatmap(
+    avg_expr_subset,
+    cluster_rows = T,
+    cluster_cols = T,
+    fontsize_row = 3,
+    fontsize_col = 5,
+    main = paste("Average Expression Heatmap for Resolution", resolution_value)
+  )
+  
+  # Save the heatmap plot to PDF
+  ggsave(
+    filename = paste0(Task3.6_Heatmap, "/Heatmap_w_resolution_", resolution_value, "_avgExpr_topMarkers.pdf"),
+    # filename = paste0(Task3.6_Heatmap, "/Heatmap_w_resolution_", resolution_value, "_avgExpr_topMarkers_not_cluster.pdf"),
+    plot = heatmap_plot,
+    width = 10,
+    height = 8
+  )
+}
+
+```
+
+```{r}
+# Z-score - row normalization:
+
+for(resolution_value in resolutions) {
+  
+  diff_resolution <- paste0("RNA_snn_res.", resolution_value)
+  
+  # Get the top marker genes for the given resolution
+  markers_df <- markers_list[[diff_resolution]]
+  
+  # Select top 10 marker genes per cluster based on avg_log2FC
+  top_markers <- markers_df %>%
+    group_by(cluster) %>%
+    top_n(10, avg_log2FC)
+  
+  # Extract the top marker genes
+  top_genes <- unique(top_markers$gene)
+  
+  # Calculate average expression of selected top genes for each cluster
+  avg_expr <- AverageExpression(
+    Combined.New.Object,
+    features = top_genes,
+    group.by = diff_resolution,
+    slot = "data"  # Use the "data" slot to get log-normalized values
+  )$RNA
+  
+  # Subset the average expression matrix to only include selected top genes
+  avg_expr_subset <- avg_expr[top_genes, ]
+  
+  # Perform row-wise z-score normalization
+  avg_expr_zscore <- t(scale(t(avg_expr_subset)))
+  
+  # Generate the heatmap
+  heatmap_plot <- pheatmap(
+    avg_expr_zscore,
+    cluster_rows = T,
+    cluster_cols = T,
+    fontsize_row = 3,
+    fontsize_col = 5,
+    main = paste("Z-score Normalized Heatmap for Resolution", resolution_value)
+  )
+  
+  # Save the heatmap plot to PDF
+  ggsave(
+    filename = paste0(Task3.6_Heatmap, "/Heatmap_w_resolution_", resolution_value, "_topMarkers_Zscore.pdf"),
+    # filename = paste0(Task3.6_Heatmap, "/Heatmap_w_resolution_", resolution_value, "_topMarkers_Zscore_not_cluster.pdf"),
+    plot = heatmap_plot,
+    width = 10,
+    height = 8
+  )
+}
+
+```
+
+```{r}
+# Test (original heatmap without average)
+# Generate heatmaps for markers at each resolution
+for(resolution_value in resolutions) {
+  
+  diff_resolution <- paste0("RNA_snn_res.", resolution_value)
+  
+  # Get the top marker genes for the given resolution
+  markers_df <- markers_list[[diff_resolution]]
+  
+  # Select top genes
+  # top_markers <- head(markers_df$gene, n = 20)  # Selecting top 20 genes
+  top_markers <- markers_df %>%
+    group_by(cluster) %>%
+    top_n(10, avg_log2FC)
+  # # Extract all marker genes
+  # all_markers <- markers_df$gene
+  
+  # Generate the heatmap
+  Combined.New.Object %>%
+    DoHeatmap(features = top_markers$gene) +
+    theme(axis.text.y = element_text(size = 3), axis.text.x = element_text(size = 3)) +
+    ggtitle(paste("Top Markers for Resolution", resolution_value)) -> heatmap_plot
+  
+  # Save the heatmap plot to PDF
+  ggsave(filename = paste0(Task3.6_Heatmap, "/Heatmap_w_resolution_", resolution_value, "_topMarkers.pdf"), plot = heatmap_plot)
+  
+  #   # Generate the heatmap
+  # Combined.New.Object %>%
+  #   DoHeatmap(features = all_markers) +
+  #   theme(axis.text.y = element_text(size = 3), axis.text.x = element_text(size = 3)) +
+  #   ggtitle(paste("Top Markers for Resolution", resolution_value)) -> heatmap_plot
+  # 
+  # # Save the heatmap plot to PDF
+  # ggsave(filename = paste0(Task3.6_Heatmap, "/Heatmap_w_resolution_", resolution_value, ".pdf"), plot = heatmap_plot)
+}
+```
+
+```{r}
+# Test
+
+DefaultAssay(Combined.New.Object) <- "RNA"
+
+# Initialize an empty data frame to store combined results
+combined_avg_expr <- data.frame()
+
+# Loop over each resolution
+for (resolution in resolutions) {
+  
+  resolution_label <- paste0("RNA_snn_res.", resolution)
+  
+  # Get the top marker genes for the current resolution
+  markers_df <- markers_list[[resolution_label]]
+  
+  # Select top 10 marker genes per cluster
+  top_markers <- markers_df %>%
+    group_by(cluster) %>%
+    top_n(10, avg_log2FC) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  # Extract the top marker gene names
+  top_marker_genes <- unique(top_markers$gene)
+  
+  # Set the active identity to the current resolution
+  Idents(Combined.New.Object) <- resolution_label
+  
+  # Extract expression data for the top marker genes
+  expr_data <- FetchData(Combined.New.Object, vars = top_marker_genes)
+  
+  # Add cluster information from metadata
+  expr_data$cluster <- Combined.New.Object@meta.data[[resolution_label]]
+  
+  # Calculate the average expression of top marker genes per cluster
+  avg_expr_per_cluster <- expr_data %>%
+    pivot_longer(cols = -cluster, names_to = "gene", values_to = "expression") %>%
+    group_by(cluster) %>%
+    summarise(mean_expression = mean(expression, na.rm = TRUE)) %>%
+    mutate(Resolution = resolution_label)
+  
+  # Store the results for this resolution
+  combined_avg_expr <- rbind(combined_avg_expr, avg_expr_per_cluster)
+}
+
+combined_avg_expr
+```
+
+```{r}
+# Test
+
+# Reshape the combined_avg_expr data such that "Resolution" is in rows and "cluster" in columns
+heatmap_data <- combined_avg_expr %>%
+  dcast(Resolution ~ cluster, value.var = "mean_expression")
+
+# Set row names as Resolution labels and remove the Resolution column
+row.names(heatmap_data) <- heatmap_data$Resolution
+heatmap_data <- heatmap_data[, -1]
+
+# Convert the data frame to a numeric matrix
+heatmap_matrix <- as.matrix(heatmap_data)
+
+# Optionally: Scale the expression values by column (z-score transformation)
+heatmap_matrix <- scale((heatmap_matrix))
+
+# Replace NA, NaN, and Inf with 0
+heatmap_matrix[is.na(heatmap_matrix)] <- 0
+heatmap_matrix[is.nan(heatmap_matrix)] <- 0
+heatmap_matrix[is.infinite(heatmap_matrix)] <- 0
+
+# Generate the heatmap using ComplexHeatmap
+Heatmap(
+  heatmap_matrix,
+  name = "Avg Expression",
+  col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")),
+  cluster_rows = F,
+  cluster_columns = F,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 8),
+  heatmap_legend_param = list(title = "Z-score")
+)
+```
+
+```{r}
+# Test
+
+DefaultAssay(Combined.New.Object) <- "RNA"
+
+resolution_label <- "RNA_snn_res.0.1"
+
+# Get the top marker genes for the given resolution
+markers_df <- markers_list[[resolution_label]]
+
+# Select top 10 marker genes per cluster
+top_markers <- markers_df %>%
+  group_by(cluster) %>%
+  top_n(10, avg_log2FC) %>%
+  distinct(gene, .keep_all = TRUE)
+
+# Extract the top marker gene names
+top_marker_genes <- unique(top_markers$gene)
+
+# Set the active identity to the resolution
+Idents(Combined.New.Object) <- resolution_label
+
+# Extract expression data for the top marker genes
+expr_data <- FetchData(Combined.New.Object, vars = top_marker_genes)
+
+# Add cluster information from metadata
+expr_data$cluster <- Combined.New.Object@meta.data[[resolution_label]]
+
+# Calculate the average expression of top marker genes per cluster
+avg_expr_per_cluster <- expr_data %>%
+  pivot_longer(cols = -cluster, names_to = "gene", values_to = "expression") %>%
+  group_by(cluster) %>%
+  summarise(mean_expression = mean(expression, na.rm = TRUE)) 
+
+print(avg_expr_per_cluster)
+```
+
+```{r}
+# Test
+
+diff_resolution <- paste0("RNA_snn_res.", "0.1")
+  
+# Get the top marker genes for the given resolution
+markers_df <- markers_list[[diff_resolution]]
+  
+# Select top 10 marker genes per cluster based on avg_log2FC
+top_markers <- markers_df %>%
+  group_by(cluster) %>%
+  top_n(10, avg_log2FC)
+  
+# Extract the top marker genes
+top_genes <- unique(top_markers$gene)
+  
+# Calculate average expression of selected top genes for each cluster
+avg_expr <- AverageExpression(
+  Combined.New.Object,
+  features = top_genes, # A list or vector of gene names for which you want to calculate the average expression.
+  group.by = diff_resolution,
+  slot = "data"  # Use the "data" slot to get log-normalized values
+)$RNA
+  
+# Subset the average expression matrix to only include selected top genes
+avg_expr_subset <- avg_expr[top_genes, ]
+  
+# Generate the heatmap
+heatmap_plot <- pheatmap(
+  avg_expr_subset,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  fontsize_row = 3,
+  fontsize_col = 5,
+  main = paste("Average Expression Heatmap for Resolution", diff_resolution)
+)
+```
+
+# SAVE POINT
+
+```{r}
+# saveRDS(markers_list, file = paste0(save_point, "/markers_list_resolution_0.05.rds"))
+# 
+# saveRDS(Combined.New.Object, file = paste0(save_point, "/Combined.New.Object_resolution_0.05.rds"))
+```
+
+```{r}
+# markers_list <- readRDS(paste0(save_point, "/markers_list_resolution_0.05.rds"))
+# 
+Combined.New.Object <- readRDS(paste0(save_point, "/Combined.New.Object_resolution_0.05.rds"))
+# 
+# Combined.New.Object@meta.data
+# 
+# resolutions <- seq(0.01, 0.03, by = 0.01)
+```
+
+## Task 3.7 The percentage of cells in each cluster
+
+```{r}
+Task3.7_Percentage_of_cells <- paste0(Task3_UMAP, "/Task3.7_Percentage_of_cells")
+if(!dir.exists(Task3.7_Percentage_of_cells)) {
+  dir.create(Task3.7_Percentage_of_cells, recursive = TRUE)
+}
+```
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+```{r}
+# Find what percentage of cells are in each cluster at different resolutions for each sample (D and R)
+# Use stacked bar plot
+
+# Identify the columns for resolution and sample
+# resolution_columns <- c("RNA_snn_res.0.01", "RNA_snn_res.0.02", "RNA_snn_res.0.03")
+resolution_columns <- c("RNA_snn_res.0.05")
+sample_column <- "new_labels" 
+
+# Calculate percentages
+percentages <- lapply(resolution_columns, function(res_col) {
+  Combined.New.Object@meta.data %>%
+    group_by(!!sym(sample_column), Cluster = !!sym(res_col)) %>%
+    summarise(Count = n(), .groups = "drop") %>%
+    group_by(!!sym(sample_column)) %>%
+    mutate(Percentage = Count / sum(Count) * 100) %>%
+    ungroup() %>%
+    mutate(Resolution = res_col)
+})
+
+# Combine percentages into one data frame
+percentages_combined <- bind_rows(percentages)
+
+# Create a bar plot
+plot <- ggplot(percentages_combined, aes(x = !!sym(sample_column), y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~Resolution, nrow = 1, scales = "free_x") +
+  labs(
+    title = "Percentage of Samples in Each Cluster Across Resolutions",
+    x = "Sample",
+    y = "Percentage",
+    fill = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+output_path <- paste0(Task3.7_Percentage_of_cells, "/Sample_Cluster_Percentages.pdf")
+ggsave(output_path, plot, width = 10, height = 8)
+```
+
+```{r}
+# Find what percentage of cells are in each cluster at different resolutions for each sample (D and R)
+# Use stacked bar plot
+
+# Identify the columns for resolution and sample
+# resolution_columns <- c("RNA_snn_res.0.01", "RNA_snn_res.0.02", "RNA_snn_res.0.03")
+sample_column <- "dominant_cell_type" 
+
+# Calculate percentages
+percentages <- lapply(resolution_columns, function(res_col) {
+  Combined.New.Object@meta.data %>%
+    group_by(!!sym(sample_column), Cluster = !!sym(res_col)) %>%
+    summarise(Count = n(), .groups = "drop") %>%
+    group_by(!!sym(sample_column)) %>%
+    mutate(Percentage = Count / sum(Count) * 100) %>%
+    ungroup() %>%
+    mutate(Resolution = res_col)
+})
+
+# Combine percentages into one data frame
+percentages_combined <- bind_rows(percentages)
+
+# Create a bar plot
+plot <- ggplot(percentages_combined, aes(x = !!sym(sample_column), y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~Resolution, nrow = 1, scales = "free_x") +
+  labs(
+    title = "Percentage of Cells in Each Cluster Across Resolutions",
+    x = "Cell",
+    y = "Percentage",
+    fill = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+output_path <- paste0(Task3.7_Percentage_of_cells, "/Cell_Cluster_Percentages.pdf")
+ggsave(output_path, plot, width = 20, height = 8)
+```
+
+## Task 3.8 GO (Gene Ontology) Enrichment Analysis
+
+```{r}
+Task3.8_GO_Enrichment <- paste0(Task3_UMAP, "/Task3.8_GO_Enrichment")
+if(!dir.exists(Task3.8_GO_Enrichment)) {
+  dir.create(Task3.8_GO_Enrichment, recursive = TRUE)
+}
+
+BP <- paste0(Task3.8_GO_Enrichment, "/BP")
+if(!dir.exists(BP)) {
+  dir.create(BP, recursive = TRUE)
+}
+
+CC <- paste0(Task3.8_GO_Enrichment, "/CC")
+if(!dir.exists(CC)) {
+  dir.create(CC, recursive = TRUE)
+}
+
+MF <- paste0(Task3.8_GO_Enrichment, "/MF")
+if(!dir.exists(MF)) {
+  dir.create(MF, recursive = TRUE)
+}
+
+for (ontology in c("BP", "CC", "MF")) {
+  if (!dir.exists(file.path(get(ontology), "dot_plots"))) {
+    dir.create(file.path(get(ontology), "dot_plots"), recursive = TRUE)
+  }
+  if (!dir.exists(file.path(get(ontology), "res_table"))) {
+    dir.create(file.path(get(ontology), "res_table"), recursive = TRUE)
+  }
+}
+```
+
+```{r}
+# Perform GO analysis using marker genes -- determine which pathways distinguish each cluster
+# It determines which pathways or processes are statistically overrepresented among the marker genes.
+# GO enrichment provides detailed annotations about biological processes (BP), cellular components (CC), or molecular functions (MF) that distinguish clusters, which are often more interpretable than pathway-level activity scores.
+# Since marker genes are already identified per cluster, GO allows you to identify distinct biological roles or pathways tied to each cluster.
+# BP -- cell cycle regulation, apoptosis, immune response, and DNA repair pathways 
+# MF -- biochemical activities of the proteins, like kinase activity or DNA binding.
+# CC -- subcellular localization, especially if you're interested in understanding how cellular compartments change during leukemia progression (e.g., alterations in the nucleus, cytoplasm, or mitochondria).
+```
+
+```{r}
+# Iterate through each resolution in markers_list
+for (res in names(markers_list)) {
+  # Get the marker genes for the current resolution
+  markers_data <- markers_list[[res]]
+  
+  # Iterate through each cluster in the current resolution
+  for (cluster in unique(markers_data$cluster)) {
+    # Get the marker genes for the current cluster
+    cluster_genes <- markers_data %>% filter(cluster == !!cluster) %>% pull(gene)
+    
+    # Perform GO enrichment for each ontology: BP, MF, and CC
+    go_bp <- enrichGO(gene = cluster_genes,
+                      OrgDb = org.Hs.eg.db,
+                      keyType = "SYMBOL",
+                      ont = "BP",  # Biological Process
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05)
+    
+    go_mf <- enrichGO(gene = cluster_genes,
+                      OrgDb = org.Hs.eg.db,
+                      keyType = "SYMBOL",
+                      ont = "MF",  # Molecular Function
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05)
+    
+    go_cc <- enrichGO(gene = cluster_genes,
+                      OrgDb = org.Hs.eg.db,
+                      keyType = "SYMBOL",
+                      ont = "CC",  # Cellular Component
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05)
+    
+    res_num <- sub("RNA_snn_res\\.", "", res)
+
+    # Create dot plots for each ontology
+    bp_plot <- dotplot(go_bp, showCategory = 10) + ggtitle(paste("BP - Cluster", cluster, "Resolution", res_num))
+    mf_plot <- dotplot(go_mf, showCategory = 10) + ggtitle(paste("MF - Cluster", cluster, "Resolution", res_num))
+    cc_plot <- dotplot(go_cc, showCategory = 10) + ggtitle(paste("CC - Cluster", cluster, "Resolution", res_num))
+    
+    # Save the dot plots to the output folder
+    ggsave(file.path(BP, "dot_plots", paste("BP", "Res", res_num, "Cluster", cluster, "plot.pdf", sep = "_")), bp_plot, width = 10, height = 8)
+    ggsave(file.path(MF, "dot_plots", paste("MF", "Res", res_num, "Cluster", cluster, "plot.pdf", sep = "_")), mf_plot, width = 10, height = 8)
+    ggsave(file.path(CC, "dot_plots", paste("CC", "Res", res_num, "Cluster", cluster, "plot.pdf", sep = "_")), cc_plot, width = 10, height = 8)
+    
+  # Save the results tables as CSV or Excel
+  bp_results_df <- as.data.frame(go_bp)
+  mf_results_df <- as.data.frame(go_mf)
+  cc_results_df <- as.data.frame(go_cc)
+  write.csv(bp_results_df, file.path(BP, "res_table", paste("BP", "Res", res_num, "Cluster", cluster, "results.csv", sep = "_")))
+  write.csv(mf_results_df, file.path(MF, "res_table", paste("MF", "Res", res_num, "Cluster", cluster, "results.csv", sep = "_")))
+  write.csv(cc_results_df, file.path(CC, "res_table", paste("CC", "Res", res_num, "Cluster", cluster, "results.csv", sep = "_")))
+  }
+}
+
+cat("GO enrichment and dot plots are saved successfully!\n")
+```
+
+```{r}
+# Test
+
+marker_genes_by_cluster <- markers_list[[3]] %>%
+  group_by(cluster) %>%
+  summarise(genes = list(gene)) %>%
+  pull(genes)
+names(marker_genes_by_cluster) <- unique(markers_list[[3]]$cluster)
+
+# Perform GO enrichment for all clusters
+go_results_list <- lapply(marker_genes_by_cluster, function(genes) {
+  enrichGO(
+    gene          = genes,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05
+  )
+})
+
+head(go_results_list[[1]])
+
+# Visualize results for a specific cluster (e.g., Cluster 1)
+dot_p <- dotplot(go_results_list[[8]], showCategory = 10)
+dot_p
+
+ggsave(file.path(CC, "dot_plots", paste("CC11111", "Res", res_num, "Cluster", cluster, "plot.pdf", sep = "_")), dot_p, width = 10, height = 8)
+```
+
+## Task 3.9 ssGSEA - Hallmark
+
+```{r}
+Task3.9_GSEA <- paste0(Task3_UMAP, "/Task3.9_ssGSEA")
+if(!dir.exists(Task3.9_GSEA)) {
+  dir.create(Task3.9_GSEA, recursive = TRUE)
+}
+```
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+```{r}
+# Use Seurat V5
+# bulk <- AggregateExpression(Combined.New.Object, group.by = "new_labels", return.seurat = FALSE)
+```
+
+### count matrix - no?
+
+```{r}
+GS.hallmark <- getGeneSets(library = "H")
+```
+
+```{r}
+# Extract the count matrix from the default assay of the Seurat object
+count_matrix <- GetAssayData(Combined.New.Object, assay = "RNA", layer = "counts")
+
+enrichment.scores <- escape.matrix(count_matrix,
+                                   gene.sets = GS.hallmark,
+                                   groups = 1000,
+                                   min.size = 5)
+```
+
+```{r}
+# Normalize by row
+scaled_enrichment_scores <- t(scale(t(enrichment.scores)))
+
+# # Replace underscores in row names with dashes
+# rownames(scaled_enrichment_scores) <- sub("_", "-", rownames(scaled_enrichment_scores))
+# 
+# head(scaled_enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+Combined.New.Object@meta.data <- cbind(
+  Combined.New.Object@meta.data,
+  scaled_enrichment_scores[rownames(Combined.New.Object@meta.data), , drop = FALSE]
+)
+
+Combined.New.Object@meta.data
+```
+
+```{r}
+# Add normalized results back to the Seurat object
+Combined.New.Object[["escape.ssGSEA"]] <- CreateAssayObject(counts = scaled_enrichment_scores)
+```
+
+```{r}
+heatmapEnrichment(scaled_enrichment_scores,
+                  group.by = "ident",
+                  gene.set.use = "all",
+                  assay = "escape.ssGSEA")
+```
+
+### sce
+
+```{r}
+Combined.New.Object.sce <- as.SingleCellExperiment(Combined.New.Object, assay = "RNA")
+```
+
+```{r}
+enrichment.scores.sce <- escape.matrix(Combined.New.Object.sce,
+                                   gene.sets = GS.hallmark,
+                                   groups = 1000,
+                                   min.size = 5)
+```
+
+```{r}
+# Normalize by row
+scaled_enrichment_scores <- t(scale(t(enrichment.scores)))
+
+# Add the scaled enrichment scores to the metadata
+Combined.New.Object@meta.data <- cbind(
+  Combined.New.Object@meta.data,
+  scaled_enrichment_scores[rownames(Combined.New.Object@meta.data), , drop = FALSE]
+)
+
+Combined.New.Object@meta.data
+
+normalized_results_df <- as.data.frame(scaled_enrichment_scores)
+
+output_file <- paste0(Task3.9_GSEA, "/escape_ssGSEA_scores_normalized_by_row.csv")
+write.csv(normalized_results_df, file = output_file, row.names = TRUE)
+```
+
+```{r}
+pathways <- c(names(GS.hallmark))
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(Combined.New.Object, reduction = "umap"))
+umap_data$snn <- Combined.New.Object@meta.data$RNA_snn_res.0.05
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- Combined.New.Object@meta.data[[pathway]]
+
+  p <- ggplot(umap_data, aes(x = umap_1, y = umap_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(snn) %>%
+                summarize(
+                  umap_1 = mean(umap_1),
+                  umap_2 = mean(umap_2)
+                ),
+              aes(label = snn), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste(pathway, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(Task3.9_GSEA, "/", pathway, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+```{r}
+heatmapEnrichment(Combined.New.Object.sce, 
+                  group.by = "ident",
+                  gene.set.use = "all",
+                  assay = "escape.ssGSEA")
+```
+
+### Seurat - Yes!
+
+```{r}
+# Use runEscape() to calculate the enrichment score and directly attach the output to a single-cell object (sce or Seurat)
+
+Combined.New.Object <- runEscape(Combined.New.Object, 
+                        method = "ssGSEA",
+                        gene.sets = GS.hallmark, 
+                        groups = 1000, 
+                        min.size = 5,
+                        new.assay.name = "escape.ssGSEA")
+```
+
+```{r}
+# Get the results
+ssGSEA_results <- GetAssayData(Combined.New.Object, assay = "escape.ssGSEA", layer = "data")
+ssGSEA_results.df <- as.data.frame(t(ssGSEA_results))
+
+# Check if all rownames match
+if (all(rownames(ssGSEA_results.df) %in% rownames(Combined.New.Object@meta.data))) {
+  # Add hallmark results to Combined.New.Object metadata
+  Combined.New.Object@meta.data <- cbind(
+    Combined.New.Object@meta.data,
+    ssGSEA_results.df[rownames(Combined.New.Object@meta.data), ]  # Align rows by name
+  )
+} else {
+  stop("Row names of ssGSEA_results.df do not match Combined.New.Object@meta.data.")
+}
+
+# Ensure rownames of ssGSEA_results.df and Combined.New.Object@meta.data match
+if (all(rownames(ssGSEA_results.df) %in% rownames(Combined.New.Object@meta.data))) {
+  # Extract new_labels from Combined.New.Object metadata
+  ssGSEA_results.df$new_labels <- Combined.New.Object@meta.data[rownames(ssGSEA_results.df), "new_labels"]
+
+  # Move new_labels to the first column
+  ssGSEA_results.df <- ssGSEA_results.df[, c("new_labels", setdiff(colnames(ssGSEA_results.df), "new_labels"))]
+} else {
+  stop("Row names of ssGSEA_results.df do not match Combined.New.Object@meta.data.")
+}
+
+# Averages ssGSEA scores by sample and then normalizes each hallmark pathway across all samples.
+ssGSEA_results.df <- ssGSEA_results.df %>%
+  group_by(new_labels) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  ungroup() %>%  # Ungroup after summarizing
+  mutate(across(-new_labels, scale))  # Normalize the hallmark pathways
+
+# normalized_results <- t(scale(t(ssGSEA_results)))
+normalized_results <- scale(ssGSEA_results)
+
+# Add normalized results back to the Seurat object
+Combined.New.Object <- SetAssayData(
+  Combined.New.Object,
+  assay = "escape.ssGSEA",
+  layer = "data",
+  new.data = normalized_results
+)
+
+normalized_results_df <- as.data.frame(normalized_results)
+
+output_file <- paste0(Task3.9_GSEA, "/escape_ssGSEA_scores_normalized_by_sample.csv")
+write.csv(ssGSEA_results.df, file = output_file, row.names = F)
+```
+
+```{r}
+# Set new_labels as rownames for the ssGSEA results
+rownames(ssGSEA_results.df) <- ssGSEA_results.df$new_labels
+
+# Remove the new_labels column as it's now used as rownames
+ssGSEA_results.df <- ssGSEA_results.df %>% dplyr::select(-new_labels)
+
+
+
+library(pheatmap)
+
+# Transpose the data to have samples as columns and hallmark pathways as rows
+heatmap_data <- t(ssGSEA_results.df %>% 
+                  dplyr::select(-new_labels))  # Remove new_labels column for heatmap and transpose
+
+# Generate the heatmap
+pheatmap(heatmap_data,
+         cluster_rows = TRUE,  # Cluster rows (hallmark pathways)
+         cluster_cols = TRUE,  # Cluster columns (samples)
+         scale = "none",       # Data is already normalized, no need to scale
+         annotation_col = data.frame(Sample = ssGSEA_results.df$new_labels),  # Add sample annotation
+         show_rownames = TRUE,  # Show hallmark pathway names
+         show_colnames = TRUE,  # Show sample names
+         color = colorRampPalette(c("blue", "white", "red"))(100)  # Customize color palette
+)
+```
+
+```{r}
+# # Normalize by row
+# ssGSEA_results <- GetAssayData(Combined.New.Object, assay = "escape.ssGSEA", layer = "data")
+# head(ssGSEA_results)
+# 
+# View(Combined.New.Object@assays[["escape.ssGSEA"]]@data)
+# 
+# # normalized_results <- t(scale(t(ssGSEA_results)))
+# normalized_results <- scale(ssGSEA_results)
+# 
+# # Add normalized results back to the Seurat object
+# Combined.New.Object <- SetAssayData(
+#   Combined.New.Object,
+#   assay = "escape.ssGSEA",
+#   layer = "data",
+#   new.data = normalized_results
+# )
+# 
+# normalized_results_df <- as.data.frame(normalized_results)
+# 
+# output_file <- paste0(Task3.9_GSEA, "/escape_ssGSEA_scores_normalized_by_row.csv")
+# write.csv(normalized_results_df, file = output_file, row.names = TRUE)
+# ```
+# 
+# ```{r}
+# # Define the output file path
+# output_file <- paste0(Task3.9_GSEA, "/heatmapEnrichment.pdf")
+# 
+# pdf(file = output_file, width = 10, height = 20)
+# 
+# heatmapEnrichment(Combined.New.Object,
+#                   group.by = "ident",
+#                   gene.set.use = "all",
+#                   assay = "escape.ssGSEA")
+# 
+# dev.off()
+```
+
+```{r}
+# Define the pathway of interest
+pathway_of_interest <- "HALLMARK-ADIPOGENESIS"
+
+# Check if the pathway exists in the escape.ssGSEA assay
+if (pathway_of_interest %in% rownames(Combined.New.Object[["escape.ssGSEA"]])) {
+  
+  # Extract the pathway scores
+  pathway_scores <- FetchData(Combined.New.Object, vars = pathway_of_interest, layer = "data", assay = "escape.ssGSEA")
+  
+  # Add pathway scores to metadata
+  Combined.New.Object[[pathway_of_interest]] <- pathway_scores
+  
+  # Create a UMAP plot for the pathway
+  FeaturePlot(Combined.New.Object, features = pathway_of_interest, reduction = "umap") +
+    ggtitle(paste("UMAP of", pathway_of_interest))
+  
+} else {
+  cat("Pathway not found in the escape.ssGSEA assay.\n")
+}
+
+```
+
+```{r}
+## ???
+umap_data <- as.data.frame(Embeddings(Combined.New.Object, reduction = "harmony"))
+umap_data$dominant_cell_type <- Combined.New.Object@meta.data$dominant_cell_type
+
+pathway_of_interest <- "HALLMARK-ADIPOGENESIS"
+pathway_scores <- FetchData(Combined.New.Object, vars = pathway_of_interest, slot = "data", assay = "escape.ssGSEA")
+umap_data$HALLMARK_ADIPOGENESIS <- pathway_scores$`HALLMARK-ADIPOGENESIS`
+
+p <- ggplot(umap_data, aes(x = harmony_1, y = harmony_2)) +
+    # Use transparent points with the specified color scale
+    geom_point(aes(color = HALLMARK_ADIPOGENESIS), alpha = 0.4, size = 1) +
+    # Viridis color scale for the pathway scores
+    scale_color_viridis_c(option = "viridis", name = "Activity Score", direction = 1) +
+    # Add cluster labels (dominant cell type)
+    geom_text(
+        data = umap_data %>%
+            group_by(dominant_cell_type) %>%
+            summarize(
+                harmony_1 = mean(harmony_1),
+                harmony_2 = mean(harmony_2)
+            ),
+        aes(x = harmony_1, y = harmony_2, label = dominant_cell_type),
+        size = 3, fontface = "bold", color = "black"
+    ) +
+    # Minimal theme and custom labels
+    theme_minimal() +
+    labs(
+        title = paste("UMAP of", "HALLMARK_ADIPOGENESIS", "Pathway"),
+        x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+        legend.position = "right",
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank()
+    )
+
+p
+
+
+
+
+p <- ggplot(umap_data, aes(x = harmony_1, y = harmony_2)) +
+    geom_point(aes(color = !!sym(HALLMARK_ADIPOGENESIS)), alpha = 0.4, size = 1) +
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(dominant_cell_type) %>%
+                summarize(
+                  harmony_1 = mean(harmony_1),
+                  harmony_2 = mean(harmony_2)
+                ),
+              aes(label = dominant_cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(title = paste("UMAP of", "HALLMARK_ADIPOGENESIS", "Pathway"),
+         x = "UMAP 1", y = "UMAP 2") +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+```
+
+# 4. Bar Plot for cell types
+
+```{r}
+Task4_Bar_Plot = paste0(folder.name, "/Task4_Bar_Plot")
+
+if(!exists(Task4_Bar_Plot)){
+  dir.create(Task4_Bar_Plot, recursive = TRUE)
+}
+```
+
+```{r}
+# Specify the desired order for new_labels
+ordered_labels <- c("ETV001_D", "ETV001_R", 
+                    "ETV002_D", "ETV002_R",
+                    "ETV003_D", "ETV003_R",
+                    "ETV004_D", "ETV004_R",
+                    "ETV005_D", "ETV005_R",
+                    "LH001_D", "LH001_R",
+                    "LH002_D", "LH002_R",
+                    "LH003_D", "LH003_R",
+                    "NH001_D", "NH001_R",
+                    "NH002_D", "NH002_R",
+                    "NH003_D", "NH003_R",
+                    "NH004_D", "NH004_R",
+                    "NH005_D", "NH005_R",
+                    "NH006_D", "NH006_R",
+                    "NH007_D", "NH007_R",
+                    "NH008_D", "NH008_R",
+                    "PH001_D", "PH001_R",
+                    "PH002_D", "PH002_R",
+                    "PH003_D", "PH003_R")
+
+
+# Aggregate the data by 'new_labels' and 'dominant_cell_type'
+dominant_counts <- Combined.New.Object@meta.data %>%
+  group_by(new_labels, dominant_cell_type) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+# Convert 'new_labels' to a factor with the specified order
+dominant_counts <- dominant_counts %>%
+  mutate(new_labels = factor(new_labels, levels = ordered_labels))
+
+# Calculate total counts per new_labels for normalization
+totals <- dominant_counts %>%
+  group_by(new_labels) %>%
+  summarise(Total = sum(Count), .groups = 'drop')
+
+# Join the totals back to the original counts and calculate proportions
+dominant_counts <- dominant_counts %>%
+  left_join(totals, by = "new_labels") %>%
+  mutate(Proportion = Count / Total)
+
+bar_plot <- ggplot(dominant_counts, aes(x = new_labels, y = Proportion, fill = dominant_cell_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_minimal() +
+  labs(x = "Samples", y = "Proportion of Cells", fill = "Dominant Cell Type") +
+  ggtitle("Proportion of Dominant Cell Types by Samples") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6))
+
+print(bar_plot)
+
+# ggsave(paste0(Task4_Bar_Plot, "/dominant_cell_types_proportion.pdf"), bar_plot, device = "pdf", width = 10, height = 8)
+```
+
+# 5. Comparison Between Diagnosis and Relapse
+
+```{r}
+Task5_Diagnosis_Relapse_Comparison = paste0(folder.name, "/Task5_Diagnosis_Relapse_Comparison")
+
+if(!exists(Task5_Diagnosis_Relapse_Comparison)){
+  dir.create(Task5_Diagnosis_Relapse_Comparison, recursive = TRUE)
+}
+```
+
+```{r}
+Combined.New.Object@assays
+Combined.New.Object@meta.data
+```
+
+### ? Scatter plot
+
+```{r}
+# # Scatter plot to show z-scores for each patient
+# scatter_plot <- ggplot(results_df, aes(x=Patient, y=Z_Score, color=Z_Score)) +
+#   geom_point(size=5) +
+#   theme_minimal() +
+#   labs(title="Z-Scores for Fatty Acid Metabolism Gene Set",
+#        y="Z-Score",
+#        x="Patient") +
+#   scale_color_gradient2(low="blue", mid="white", high="red", midpoint=0) +
+#   theme(axis.text.x = element_text(angle=45, hjust=1))
+# 
+# print(scatter_plot)
+
+```
+
+## Task 5.1 Pseudo Bulk
+
+```{r}
+Combined.New.Object@meta.data
+```
+
+```{r}
+# pseudobulk cells only by cell type
+# Use Seurat V4
+bulk <- AggregateExpression(Combined.New.Object, group.by = "new_labels", slot = "counts", return.seurat = FALSE)
+
+# Use Seurat V5
+bulk <- AggregateExpression(Combined.New.Object, group.by = "new_labels", return.seurat = FALSE)
+
+bulk
+```
+
+## Task 5.2 Z-score and Raw Count Plot
+
+```{r}
+Task5.2_Z_Score_and_raw_count = paste0(Task5_Diagnosis_Relapse_Comparison, "/Task5.2_Z_Score_and_Raw_Count_Plot")
+
+if(!exists(Task5.2_Z_Score_and_raw_count)){
+  dir.create(Task5.2_Z_Score_and_raw_count, recursive = TRUE)
+}
+```
+
+```{r}
+Task5.2_Raw_count = paste0(Task5.2_Z_Score_and_raw_count, "/Raw_Count_Plot")
+
+if(!exists(Task5.2_Raw_count)){
+  dir.create(Task5.2_Raw_count, recursive = TRUE)
+}
+```
+
+```{r}
+Task5.2_Z_Score = paste0(Task5.2_Z_Score_and_raw_count, "/Z_Score_Plot")
+
+if(!exists(Task5.2_Z_Score)){
+  dir.create(Task5.2_Z_Score, recursive = TRUE)
+}
+```
+
+### Task 5.2.1 SLC27A2 Gene
+
+```{r}
+# Retrieve raw count data for just the SLC27A2 gene
+bulk_data <- GetAssayData(bulk1, assay = "RNA", layer = "data")
+slc27a2_data <- bulk_data["SLC27A2", , drop = FALSE]  # Ensuring it remains a matrix
+
+slc27a2_df <- data.frame(Sample = colnames(slc27a2_data), RawCount = as.numeric(slc27a2_data))
+
+# Extract patient identifiers assuming the format "PatientID-X"
+slc27a2_df$Patient <- gsub("-(D|R)$", "", slc27a2_df$Sample)
+# Assign colors to each patient group
+slc27a2_df$Color <- as.factor(slc27a2_df$Patient)
+
+number_of_groups <- length(unique(slc27a2_df$Color))
+colors <- colorRampPalette(brewer.pal(12, "Set3"))(number_of_groups)
+
+# Create a bar plot with a custom color palette
+p <- ggplot(slc27a2_df, aes(x = Sample, y = RawCount, fill = Color)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.2f", RawCount), vjust = ifelse(RawCount >= 0, -0.3, 1.3)), color = "black", size = 2) +
+  scale_fill_manual(values = colors) +
+  theme_minimal() +
+  labs(title = "Raw Counts for SLC27A2 Across Samples",
+       x = "Sample",
+       y = "Raw Counts") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+p
+
+filename <- "Raw Counts for SLC27A2 Across Samples.pdf"
+path <- paste0(Task5.2_Raw_count)
+# ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+```
+
+```{r}
+# Calculate z-score data for just the SLC27A2 gene
+bulk_data <- GetAssayData(bulk, assay = "RNA", layer = "data")
+slc27a2_data <- bulk_data["SLC27A2", , drop = FALSE]  # Ensuring it remains a matrix
+
+z_scores <- t(scale(t(slc27a2_data)))
+
+# Actually it's just the gene's score
+mean_z_scores <- colMeans(z_scores)
+
+# Convert to a data frame for ggplot
+mean_z_scores_df <- data.frame(Sample = names(mean_z_scores), MeanZScore = mean_z_scores)
+
+# Extract patient identifiers assuming the format "PatientID-X"
+mean_z_scores_df$Patient <- gsub("-(D|R)$", "", mean_z_scores_df$Sample)
+# Assign colors to each patient group
+mean_z_scores_df$Color <- as.factor(mean_z_scores_df$Patient)
+
+number_of_groups <- length(unique(mean_z_scores_df$Color))
+colors <- colorRampPalette(brewer.pal(12, "Set3"))(number_of_groups)
+
+# Create a bar plot with a custom color palette
+p <- ggplot(mean_z_scores_df, aes(x = Sample, y = MeanZScore, fill = Color)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.2f", MeanZScore), vjust = ifelse(MeanZScore >= 0, -0.3, 1.3)), color = "black", size = 2) +
+  scale_fill_manual(values = colors) +
+  theme_minimal() +
+  labs(title = "Z-Scores for SLC27A2 Across Samples",
+       x = "Sample",
+       y = "Z-Score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+p
+
+filename <- "Z-Scores for SLC27A2 Across Samples.pdf"
+path <- paste0(Task5.2_Z_Score)
+# ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+```
+
+```{r}
+# ???? The results seems not good
+# # ??????Retrieve raw count data for just the SLC27A2 gene
+
+# bulk1 <- AggregateExpression(Combined.New.Object, group.by = "new_labels")
+
+# bulk_data <- bulk1
+# slc27a2_data <- bulk_data$RNA[rownames(bulk_data$RNA) == "SLC27A2", ]
+# 
+# slc27a2_df <- data.frame(Sample = names(slc27a2_data), RawCount = as.numeric(slc27a2_data))
+# 
+# # Extract patient identifiers assuming the format "PatientID-X"
+# slc27a2_df$Patient <- gsub("-(D|R)$", "", slc27a2_df$Sample)
+# # Assign colors to each patient group
+# slc27a2_df$Color <- as.factor(slc27a2_df$Patient)
+# 
+# number_of_groups <- length(unique(slc27a2_df$Color))
+# colors <- colorRampPalette(brewer.pal(12, "Set3"))(number_of_groups)
+# 
+# # Create a bar plot with a custom color palette
+# p <- ggplot(slc27a2_df, aes(x = Sample, y = RawCount, fill = Color)) +
+#   geom_bar(stat = "identity") +
+#   geom_text(aes(label = sprintf("%.2f", RawCount), vjust = ifelse(RawCount >= 0, -0.3, 1.3)), color = "black", size = 2) +
+#   scale_fill_manual(values = colors) +
+#   theme_minimal() +
+#   labs(title = "Raw Counts for SLC27A2 Across Samples",
+#        x = "Sample",
+#        y = "Raw Counts") +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1),
+#         legend.position = "none")
+# p
+# 
+# # filename <- "Raw Counts for SLC27A2 Across Samples.pdf"
+# # path <- paste0(Task5.2_Raw_count)
+# # ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+```
+
+### Task 5.2.2 All Pathways
+
+```{r}
+all_pathways <- list()
+
+# Define and extract gene sets from C2 curated gene sets
+c2_pathways <- c("REACTOME_FATTY_ACID_METABOLISM",
+                 "REACTOME_TP53_REGULATES_METABOLIC_GENES",
+                 "BIOCARTA_P53_PATHWAY",
+                 "REACTOME_AUTOPHAGY",
+                 "REACTOME_ERK_MAPK_TARGETS",
+                 "REACTOME_STAT5_ACTIVATION",
+                 "KEGG_MAPK_SIGNALING_PATHWAY")
+
+msigdb_c2 <- msigdbr(species = "Homo sapiens", category = "C2")
+c2_genes <- lapply(c2_pathways, function(pathway) {
+    genes <- msigdb_c2 %>%
+        dplyr::filter(gs_name == pathway) %>%
+        dplyr::pull(gene_symbol)
+    return(genes)
+})
+names(c2_genes) <- c2_pathways
+all_pathways <- c(all_pathways, c2_genes)
+
+# Define and extract gene sets from H (Hallmark)
+hallmark_pathways <- c("HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+                       "HALLMARK_APOPTOSIS")
+
+msigdb_h <- msigdbr(species = "Homo sapiens", category = "H")
+hallmark_genes <- lapply(hallmark_pathways, function(pathway) {
+    genes <- msigdb_h %>%
+        dplyr::filter(gs_name == pathway) %>%
+        dplyr::pull(gene_symbol)
+    return(genes)
+})
+names(hallmark_genes) <- hallmark_pathways
+all_pathways <- c(all_pathways, hallmark_genes)
+
+# Manually define the gene set for "GOBP_FERROPTOSIS"
+ferroptosis_genes <- c("SLC7A11", "GPX4", "SLC39A7", "TMEM164", "AIFM2")
+
+all_pathways[["GOBP_FERROPTOSIS"]] <- ferroptosis_genes
+```
+
+```{r}
+# Mean Raw Count
+
+bulk_data <- GetAssayData(bulk, assay = "RNA", layer = "data")
+
+plot_pathway_expression <- function(genes, pathway_name) {
+  # Filter bulk_data for the current pathway's genes
+  pathway_data <- bulk_data[rownames(bulk_data) %in% genes, ]
+
+  # Calculate the mean raw count for each sample (column mean)
+  mean_raw_counts <- colMeans(pathway_data, na.rm = TRUE)
+
+  # Convert mean_raw_counts to a data frame for ggplot
+  mean_raw_counts_df <- data.frame(Sample = names(mean_raw_counts), MeanRawCount = mean_raw_counts)
+
+  # Extract patient identifiers assuming the format "PatientID-X"
+  mean_raw_counts_df$Patient <- gsub("-(D|R)$", "", mean_raw_counts_df$Sample)
+  # Assign colors to each patient group
+  mean_raw_counts_df$Color <- as.factor(mean_raw_counts_df$Patient)
+
+  # Generate colors for plotting
+  number_of_groups <- length(unique(mean_raw_counts_df$Color))
+  colors <- colorRampPalette(brewer.pal(min(12, number_of_groups), "Set3"))(number_of_groups)
+
+  # Create and return a ggplot object
+  p <- ggplot(mean_raw_counts_df, aes(x = Sample, y = MeanRawCount, fill = Color)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.2f", MeanRawCount), vjust = ifelse(MeanRawCount >= 0, -0.3, 1.3)), color = "black", size = 2) +
+    scale_fill_manual(values = colors) +
+    theme_minimal() +
+    labs(title = paste("Mean Raw Count for", pathway_name),
+         x = "Sample",
+         y = "Mean Raw Count") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+
+  print(p)
+  
+  filename <- paste("Mean Raw Count for", pathway_name, ".pdf")
+  path <- paste0(Task5.2_Raw_count)
+  ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+}
+
+# Loop through all pathways and plot each
+lapply(names(all_pathways), function(pathway_name) {
+  plot_pathway_expression(all_pathways[[pathway_name]], pathway_name)
+})
+```
+
+```{r}
+# Z-score
+
+bulk_data <- GetAssayData(bulk, assay = "RNA", layer = "data")
+
+plot_pathway_expression <- function(genes, pathway_name) {
+  # Filter bulk_data for the current pathway's genes
+  pathway_data <- bulk_data[rownames(bulk_data) %in% genes, ]
+
+  # Calculate z-scores
+  z_scores <- t(scale(t(pathway_data)))
+
+  # Calculate the mean z-score for each sample
+  mean_z_scores <- colMeans(z_scores)
+
+  # Convert mean_z_scores to a data frame for ggplot
+  mean_z_scores_df <- data.frame(Sample = names(mean_z_scores), MeanZScore = mean_z_scores)
+
+  # Extract patient identifiers assuming the format "PatientID-X"
+  mean_z_scores_df$Patient <- gsub("-(D|R)$", "", mean_z_scores_df$Sample)
+  # Assign colors to each patient group
+  mean_z_scores_df$Color <- as.factor(mean_z_scores_df$Patient)
+
+  # Generate colors for plotting
+  number_of_groups <- length(unique(mean_z_scores_df$Color))
+  colors <- colorRampPalette(brewer.pal(min(12, number_of_groups), "Set3"))(number_of_groups)
+
+  # Create and return a ggplot object
+  p <- ggplot(mean_z_scores_df, aes(x = Sample, y = MeanZScore, fill = Color)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.2f", MeanZScore), vjust = ifelse(MeanZScore >= 0, -0.3, 1.3)), color = "black", size = 2) +
+    scale_fill_manual(values = colors) +
+    theme_minimal() +
+    labs(title = paste("Mean Z-Scores for", pathway_name),
+         x = "Sample",
+         y = "Mean Z-Score") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+
+  print(p)
+  
+  filename <- paste("Mean Z-Scores for", pathway_name, ".pdf")
+  path <- paste0(Task5.2_Z_Score)
+  ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+}
+
+# Loop through all pathways and plot each
+lapply(names(all_pathways), function(pathway_name) {
+  plot_pathway_expression(all_pathways[[pathway_name]], pathway_name)
+})
+```
+
+## **Task 5.2.3 Henry_SuperStructure Data Z-Score
+
+```{r}
+Henry_file_path <- "Gene List for MW_09_14_2024.xlsx"
+
+Henry_data <- read_excel(Henry_file_path, sheet = 1, col_names = FALSE)
+
+# Extract the second column as a gene list
+Henry_gene_list <- Henry_data[[2]]
+
+Henry_gene_list
+```
+
+```{r}
+# Function to clean and split gene names
+clean_and_split_genes <- function(genes) {
+  # Replace " or " with "/" to have a single delimiter
+  cleaned_genes <- str_replace_all(genes, " or ", "/")
+  
+  # Split the gene names by "/" (to handle both "or" and "/")
+  split_genes <- str_split(cleaned_genes, "/")
+  
+  # Flatten the list into a single vector
+  split_genes <- unlist(split_genes)
+  
+  # Trim any leading/trailing whitespace
+  split_genes <- str_trim(split_genes)
+  
+  # Replace "IL-15" with "IL15"
+  split_genes <- str_replace_all(split_genes, "IL-15", "IL15")
+  
+  return(split_genes)
+}
+
+Henry_final_gene_list <- unlist(lapply(Henry_gene_list, clean_and_split_genes))
+
+Henry_final_gene_list
+```
+
+```{r}
+bulk_data <- GetAssayData(bulk, assay = "RNA", layer = "data")
+
+# Z-score plotting function, using Henry_gene_list
+plot_henry_expression <- function(genes, pathway_name = "Henry_SuperStructure Gene List") {
+  # Filter bulk_data for the current pathway's genes
+  pathway_data <- bulk_data[rownames(bulk_data) %in% genes, ]
+  
+  # Calculate z-scores
+  z_scores <- t(scale(t(pathway_data)))
+  
+  # Calculate the mean z-score for each sample
+  mean_z_scores <- colMeans(z_scores)
+  
+  # Convert mean_z_scores to a data frame for ggplot
+  mean_z_scores_df <- data.frame(Sample = names(mean_z_scores), MeanZScore = mean_z_scores)
+  
+  # Extract patient identifiers assuming the format "PatientID-X"
+  mean_z_scores_df$Patient <- gsub("-(D|R)$", "", mean_z_scores_df$Sample)
+  # Assign colors to each patient group
+  mean_z_scores_df$Color <- as.factor(mean_z_scores_df$Patient)
+  
+  # Generate colors for plotting
+  number_of_groups <- length(unique(mean_z_scores_df$Color))
+  colors <- colorRampPalette(brewer.pal(min(12, number_of_groups), "Set3"))(number_of_groups)
+  
+  # Create and return a ggplot object
+  p <- ggplot(mean_z_scores_df, aes(x = Sample, y = MeanZScore, fill = Color)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.2f", MeanZScore), vjust = ifelse(MeanZScore >= 0, -0.3, 1.3)), color = "black", size = 2) +
+    scale_fill_manual(values = colors) +
+    theme_minimal() +
+    labs(title = paste("Mean Z-Scores for", pathway_name),
+         x = "Sample",
+         y = "Mean Z-Score") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  
+  print(p)
+  
+  # Save the plot
+  filename <- paste("Task5.2.3_Mean Z-Scores for", pathway_name, ".pdf")
+  path <- paste0(Task5_Diagnosis_Relapse_Comparison)
+  ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+  
+  # Create a heatmap using SeuratExtend::Heatmap
+  heatmap_plot <- SeuratExtend::Heatmap(
+    z_scores,  # Matrix with gene expression z-scores
+    main = paste("Z-Score Heatmap for", pathway_name),
+    color = colorRampPalette(c("blue", "white", "red"))(100),
+    lab_fill = "Z-Score",
+    # Adjust the left margin to ensure long labels are not cut off
+    plot.margin = margin(t = 5.5, r = 5.5, b = 5.5, l = 30) 
+  )
+  
+  # Save the heatmap
+  heatmap_filename <- paste("Task5.2.3_Heatmap Z-Scores for", pathway_name, ".pdf")
+  ggsave(filename = file.path(path, heatmap_filename), plot = heatmap_plot, width = 12, height = 10)
+
+}
+
+plot_henry_expression(Henry_final_gene_list)
+```
+
+```{r}
+# Check Which genes are not in bulk_genes
+
+bulk_genes <- rownames(bulk_data)
+
+genes_in_bulk <- Henry_final_gene_list[Henry_final_gene_list %in% bulk_genes]
+
+genes_not_in_bulk <- Henry_final_gene_list[!(Henry_final_gene_list %in% bulk_genes)]
+
+# Output the results
+cat("Genes found in bulk_data:\n")
+print(genes_in_bulk)
+
+cat("\nGenes NOT found in bulk_data:\n")
+print(genes_not_in_bulk)
+
+if ("IL15" %in% bulk_genes) {
+  cat("IL15 is present in bulk_genes.\n")
+} else {
+  cat("IL15 is NOT present in bulk_genes.\n")
+}
+```
+
+
+
+
+
+## **Task 5.2.4 Fatty Acid vs TP53 (change to 5.2.4)
+
+```{r}
+all_pathways_sub <- list()
+
+# Define and extract gene sets from C2 curated gene sets
+c2_pathways_sub <- c("REACTOME_FATTY_ACID_METABOLISM",
+                 "REACTOME_TP53_REGULATES_METABOLIC_GENES")
+
+msigdb_c2 <- msigdbr(species = "Homo sapiens", category = "C2")
+c2_genes_sub <- lapply(c2_pathways_sub, function(pathway) {
+    genes <- msigdb_c2 %>%
+        dplyr::filter(gs_name == pathway) %>%
+        dplyr::pull(gene_symbol)
+    return(genes)
+})
+names(c2_genes_sub) <- c2_pathways_sub
+all_pathways_sub <- c(all_pathways_sub, c2_genes_sub)
+```
+
+```{r}
+#### Export the gene lists.
+
+wb <- createWorkbook()
+
+short_names <- c("REACTOME_FATTY_ACID_METABOLISM" = "Fatty Acid",
+                 "REACTOME_TP53_REGULATES_METABOLIC_GENES" = "TP53")
+
+full_names <- c("REACTOME_FATTY_ACID_METABOLISM" = "REACTOME FATTY ACID METABOLISM",
+                "REACTOME_TP53_REGULATES_METABOLIC_GENES" = "REACTOME TP53 REGULATES METABOLIC GENES")
+
+# Iterate over the gene lists and add each as a new sheet with a header
+lapply(names(all_pathways_sub), function(pathway) {
+  addWorksheet(wb, sheetName = short_names[pathway])
+  # Create a data frame for the genes with a header
+  gene_data <- data.frame(Genes = unique(all_pathways_sub[[pathway]]))
+  # Write data with the pathway name as header
+  writeData(wb, sheet = short_names[pathway], x = gene_data, startRow = 1)
+  # Add the full pathway name as the header in the first row
+  writeData(wb, sheet = short_names[pathway], x = matrix(full_names[pathway], ncol = 1), startRow = 1, startCol = 1, colNames = FALSE)
+})
+
+# Construct the file path with a dynamic component
+file_path <- paste0(Task5_Diagnosis_Relapse_Comparison, "/Pathways_Gene_Lists.xlsx")
+
+saveWorkbook(wb, file_path, overwrite = TRUE)
+
+```
+
+```{r}
+# Z-score
+
+bulk_data <- GetAssayData(bulk, assay = "RNA", layer = "data")
+
+extract_pathway_expression <- function(genes, pathway_name) {
+  # Filter bulk_data for the current pathway's genes
+  pathway_data <- bulk_data[rownames(bulk_data) %in% genes, ]
+
+  # Calculate z-scores
+  z_scores <- t(scale(t(pathway_data)))
+
+  # Calculate the mean z-score for each sample
+  mean_z_scores <- colMeans(z_scores)
+
+  # Convert mean_z_scores to a data frame for ggplot
+  mean_z_scores_df <- data.frame(Sample = names(mean_z_scores), MeanZScore = mean_z_scores)
+
+  # Extract patient identifiers assuming the format "PatientID-X"
+  mean_z_scores_df$Patient <- gsub("-(D|R)$", "", mean_z_scores_df$Sample)
+  
+  # Return the data frame
+  return(mean_z_scores_df)
+}
+
+# Collect results for each pathway in a list with named elements
+pathway_results_list_sub <- setNames(lapply(names(all_pathways_sub), function(pathway_name) {
+  extract_pathway_expression(all_pathways_sub[[pathway_name]], pathway_name)
+}), names(all_pathways_sub))
+```
+
+```{r}
+calculate_fold_changes <- function(df) {
+  # Separate and prepare diagnosis and relapse data frames
+  df_diag <- df %>% filter(str_detect(Sample, "-D")) %>%
+    mutate(Patient = str_replace(Sample, "-D", "")) %>%
+    arrange(Patient)
+
+  df_relapse <- df %>% filter(str_detect(Sample, "-R")) %>%
+    mutate(Patient = str_replace(Sample, "-R", "")) %>%
+    arrange(Patient)
+
+  # Check if both data frames are aligned
+  if(!all(df_diag$Patient == df_relapse$Patient)) {
+    stop("Patients are not aligned between diagnosis and relapse.")
+  }
+
+  # Calculate fold changes
+  fold_changes <- df_relapse$MeanZScore / df_diag$MeanZScore
+
+  results_df <- data.frame(Patient = df_diag$Patient, FoldChange = fold_changes)
+  return(results_df)
+}
+
+# Apply function to each pathway
+fatty_acid_results <- calculate_fold_changes(pathway_results_list_sub[["REACTOME_FATTY_ACID_METABOLISM"]])
+tp53_results <- calculate_fold_changes(pathway_results_list_sub[["REACTOME_TP53_REGULATES_METABOLIC_GENES"]])
+
+# Merge the results for plotting
+combined_results <- merge(fatty_acid_results, tp53_results, by = "Patient", suffixes = c("_FattyAcid", "_TP53"))
+
+p <- ggplot(combined_results, aes(x = FoldChange_TP53, y = FoldChange_FattyAcid)) +
+  geom_point(aes(color = Patient), size = 3) +
+  geom_smooth(method = "loess", color = "blue", se = FALSE) +
+  geom_text(aes(label = Patient), vjust = 1.5, hjust = 1.5, size = 1, color = "black") +  # Add labels
+  labs(title = "Comparison of Fold Changes (Relapse / Diagnosis)",
+       x = "Fold Change (R/D) - TP53 Metabolism",
+       y = "Fold Change (R/D) - Fatty Acid Metabolism") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p)
+
+filename <- paste("Task5.2.3_Comparison_of_Fold_Changes_", "Fatty_Acid_vs_TP53", ".pdf")
+path <- paste0(Task5_Diagnosis_Relapse_Comparison)
+ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+```
+
+```{r}
+########## Remove some samples
+### For D / R: Remove ETV002 and PH001
+### For R / D: Remove ETV004 and NH008
+
+calculate_fold_changes <- function(df) {
+  # Separate and prepare diagnosis and relapse data frames
+  df_diag <- df %>% filter(str_detect(Sample, "-D")) %>%
+    mutate(Patient = str_replace(Sample, "-D", "")) %>%
+    arrange(Patient)
+
+  df_relapse <- df %>% filter(str_detect(Sample, "-R")) %>%
+    mutate(Patient = str_replace(Sample, "-R", "")) %>%
+    arrange(Patient)
+
+  # Check if both data frames are aligned
+  if(!all(df_diag$Patient == df_relapse$Patient)) {
+    stop("Patients are not aligned between diagnosis and relapse.")
+  }
+
+  # Calculate fold changes
+  fold_changes <- df_diag$MeanZScore / df_relapse$MeanZScore
+
+  results_df <- data.frame(Patient = df_diag$Patient, FoldChange = fold_changes)
+  return(results_df)
+}
+
+# Apply function to each pathway and exclude some samples
+fatty_acid_results <- calculate_fold_changes(pathway_results_list_sub[["REACTOME_FATTY_ACID_METABOLISM"]]) %>%
+  filter(!Patient %in% c("ETV004", "ETV002", "NH008"))
+tp53_results <- calculate_fold_changes(pathway_results_list_sub[["REACTOME_TP53_REGULATES_METABOLIC_GENES"]]) %>%
+  filter(!Patient %in% c("ETV004", "ETV002", "NH008"))
+
+# Merge the results for plotting
+combined_results <- merge(fatty_acid_results, tp53_results, by = "Patient", suffixes = c("_FattyAcid", "_TP53"))
+
+# Plot
+p <- ggplot(combined_results, aes(x = FoldChange_TP53, y = FoldChange_FattyAcid)) +
+  geom_point(aes(color = Patient), size = 3) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  # geom_smooth(method = "loess", color = "blue", se = FALSE) +
+  geom_text(aes(label = Patient), vjust = 1.5, hjust = 1.5, size = 2, color = "black") +  # Add labels
+  labs(title = "Comparison of Fold Changes (Relapse / Diagnosis) Subset",
+       x = "Fold Change (R/D) - TP53 Metabolism",
+       y = "Fold Change (R/D) - Fatty Acid Metabolism") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p)
+
+filename <- paste("Task5.2.3_Comparison_of_Fold_Changes_subset_", "Fatty_Acid_vs_TP53", ".pdf")
+path <- Task5_Diagnosis_Relapse_Comparison
+ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+```
+
+```{r}
+calculate_log2_fold_changes <- function(df) {
+  # Separate and prepare diagnosis and relapse data frames
+  df_diag <- df %>% filter(str_detect(Sample, "-D")) %>%
+    mutate(Patient = str_replace(Sample, "-D", "")) %>%
+    arrange(Patient)
+
+  df_relapse <- df %>% filter(str_detect(Sample, "-R")) %>%
+    mutate(Patient = str_replace(Sample, "-R", "")) %>%
+    arrange(Patient)
+
+  # Check if both data frames are aligned
+  if(!all(df_diag$Patient == df_relapse$Patient)) {
+    stop("Patients are not aligned between diagnosis and relapse.")
+  }
+
+  # Calculate log 2 fold changes
+  # Add a small constant to avoid division by zero or negative results
+  ##### But the original Z-scores are too small, like 0.2, 0.3, so this pseudocount might be too big and influence 
+  pseudocount <- 0.4
+  # log2_fold_changes <- log2((df_diag$MeanZScore + pseudocount) / (df_relapse$MeanZScore + pseudocount))
+  log2_fold_changes <- log2((df_diag$MeanZScore) / (df_relapse$MeanZScore))
+  # log2_fold_changes <- log2(abs((df_diag$MeanZScore) / (df_relapse$MeanZScore)))
+
+  results_df <- data.frame(Patient = df_diag$Patient, Log2FoldChange = log2_fold_changes)
+  return(results_df)
+}
+
+# Apply function to each pathway
+fatty_acid_results_log2 <- calculate_log2_fold_changes(pathway_results_list_sub[["REACTOME_FATTY_ACID_METABOLISM"]])
+tp53_results_log2 <- calculate_log2_fold_changes(pathway_results_list_sub[["REACTOME_TP53_REGULATES_METABOLIC_GENES"]])
+
+# Merge the results for plotting
+combined_results_log2 <- merge(fatty_acid_results_log2, tp53_results_log2, by = "Patient", suffixes = c("_FattyAcid", "_TP53"))
+
+p <- ggplot(combined_results_log2, aes(x = Log2FoldChange_TP53, y = Log2FoldChange_FattyAcid)) +
+  geom_point(aes(color = Patient), size = 3) +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) +
+  geom_text(aes(label = Patient), vjust = 1.5, hjust = 1.5, size = 1, color = "black") +  # Add labels
+  labs(title = "Comparison of Log2FC (D/R)",
+       x = "Log2FC - TP53 Metabolism",
+       y = "Log2FC - Fatty Acid Metabolism") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(p)
+
+filename <- paste("Task5.2.3_Comparison_of_Log2FC_", "Fatty_Acid_vs_TP53", ".pdf")
+path <- paste0(Task5_Diagnosis_Relapse_Comparison)
+ggsave(filename = file.path(path, filename), plot = p, width = 10, height = 8)
+```
+
+
+
+
+
+## Task 5.3 GSEA - Hallmarks
+
+```{r}
+Task5.3_GSEA_Hallmark <- paste0(Task5_Diagnosis_Relapse_Comparison, "/Task5.3_GSEA_Hallmark")
+  
+if(!exists(Task5.3_GSEA_Hallmark)){
+  dir.create(Task5.3_GSEA_Hallmark)
+}
+```
+
+### Task 5.3.1 DE analysis
+
+```{r}
+Task5.3.1_DE_Analysis <- paste0(Task5.3_GSEA_Hallmark, "/Task5.3.1_DE_Analysis")
+  
+if(!exists(Task5.3.1_DE_Analysis)){
+  dir.create(Task5.3.1_DE_Analysis)
+}
+```
+
+```{r}
+patient_ids <- unique(sapply(strsplit(colnames(bulk_data), "-"), `[`, 1))
+
+de_results_list <- list()
+
+# Iterate over each patient
+for (patient_id in patient_ids) {
+  # Define labels for Diagnosis and Relapse
+  diag_label <- paste(patient_id, "D", sep="_")
+  relapse_label <- paste(patient_id, "R", sep="_")
+  
+  # Subset Seurat object for Diagnosis and Relapse for the current patient
+  subset_seurat <- subset(Combined.New.Object, subset = new_labels %in% c(diag_label, relapse_label))
+  
+  # Set identities specifically for DE analysis
+  Idents(subset_seurat) <- subset_seurat$new_labels
+  
+  # Perform DE analysis using FindMarkers
+  de_results <- FindMarkers(subset_seurat, ident.1 = diag_label, ident.2 = relapse_label, min.pct = 0.1, logfc.threshold = 0.25)
+  
+  # Store results in the list with a unique key
+  de_key <- paste(patient_id, "Diagnosis_vs_Relapse", sep="_")
+  de_results_list[[de_key]] <- de_results
+  
+  write.csv(de_results, paste0(Task5.3.1_DE_Analysis, "/", patient_id, "_Diagnosis_vs_Relapse.csv"))
+}
+
+# Convert the list of DE results into a tibble
+de_results_tibble <- tibble(
+  Comparison = names(de_results_list),
+  Results = de_results_list
+)
+```
+
+# SAVE POINT
+
+```{r}
+saveRDS(de_results_tibble, file = paste0(save_point, "/de_results_tibble.rds"))
+```
+
+```{r}
+# de_results_tibble <- readRDS(paste0(save_point, "/de_results_tibble.rds"))
+```
+
+### Task 5.3.2 GSEA
+
+```{r}
+Task5.3.2_GSEA_Hallmark_results <- paste0(Task5.3_GSEA_Hallmark, "/Task5.3.2_GSEA_Hallmark_results")
+  
+if(!exists(Task5.3.2_GSEA_Hallmark_results)){
+  dir.create(Task5.3.2_GSEA_Hallmark_results)
+}
+```
+
+```{r}
+GSEA_sample_dir_significant <- paste0(Task5.3.2_GSEA_Hallmark_results, "/most_significant_pathways")
+
+if(!dir.exists(paste0(GSEA_sample_dir_significant, "/res_data"))) {
+  dir.create(paste0(GSEA_sample_dir_significant, "/res_data"), recursive = TRUE)
+}
+
+if(!dir.exists(paste0(GSEA_sample_dir_significant, "/plot_data"))) {
+  dir.create(paste0(GSEA_sample_dir_significant, "/plot_data"), recursive = TRUE)
+}
+
+if(!dir.exists(paste0(GSEA_sample_dir_significant, "/Plots"))) {
+  dir.create(paste0(GSEA_sample_dir_significant, "/Plots"), recursive = TRUE)
+}
+```
+
+```{r}
+# Prepare Hallmark gene sets for fgsea
+prepareGeneSets <- function() {
+  msigdbr.Hallmark.df <- msigdbr(species = "Homo sapiens", category = "H")
+  fgsea_hallmark_sets <- msigdbr.Hallmark.df %>% 
+    split(x = .$gene_symbol, f = .$gs_name)
+  return(fgsea_hallmark_sets)
+}
+
+# Perform fgsea and handle results
+run_fgsea_save_results <- function(de_results, comparison_name, output_dir) {
+  # Generate ranks for fgsea
+  markers_to_rank <- as.data.frame(de_results)
+  markers_to_rank$gene_symbol <- rownames(markers_to_rank)
+  
+  ranks <- markers_to_rank %>%
+    dplyr::select(gene_symbol, avg_log2FC) %>%
+    arrange(desc(avg_log2FC)) %>%
+    deframe()
+
+  # Run fgsea
+  fgseaRes <- fgsea(prepareGeneSets(), stats = ranks)
+  
+  # Process and save results
+  fgseaResTidy <- fgseaRes %>%
+    mutate(abbrev_pathway = abbreviate(pathway)) |> 
+    relocate(abbrev_pathway, .after = pathway) |> 
+    as_tibble() %>%
+    arrange(desc(NES))
+  
+  write_csv(fgseaResTidy, file = paste0(output_dir, "/res_data/GSEA_HALLMARK_", comparison_name, ".csv"))
+  
+  # Output plots
+  output_plotData(fgseaResTidy, comparison_name, output_dir)
+}
+
+# Output plots and summary tables
+output_plotData <- function(fgseaResTidy, comparison_name, output_dir) {
+  # only plot the top 40 pathways
+  fgseaResTidy %>%
+    mutate(NES2 = ifelse(NES > 0, "Enriched in Diagnosis", "Enriched in Relapse")) %>%
+    filter(pval < 0.05) %>%
+    arrange(desc(NES)) %>%
+    head(n = 40) -> GSEA.plot.data
+
+  GSEA.plot.data %>%
+    mutate(Lead_size = as.integer(map(leadingEdge, length))) %>%
+    mutate(Lead_Genes = as.character(map(leadingEdge, paste0, collapse = ","))) %>%
+    dplyr::select(-c(leadingEdge, NES2, size)) %>% 
+    write_csv(file = paste0(output_dir, "/plot_data/GSEA_HALLMARK_Plot_data_", comparison_name, ".csv"))
+
+  # Column Plot
+  cols = c("Enriched in Diagnosis" = "green", "Enriched in Relapse" = "red")
+  
+  p <- GSEA.plot.data %>%
+      ggplot(aes(fct_reorder(pathway, NES), NES)) +
+      geom_col(aes(fill = NES2)) +
+      # scale_fill_manual("NES", values = cols) +
+      scale_fill_manual("NES", values = cols, breaks = c("Enriched in Diagnosis", "Enriched in Relapse")) +
+      coord_flip() + 
+      theme(axis.text.y = element_text(size = 6)) +
+      labs(x = "Pathway", y = "Normalized Enrichment Score", title = comparison_name)
+  ggsave(filename = paste0(output_dir, "/Plots/GSEA_HALLMARK_", comparison_name, ".pdf"))
+    
+  return(p)
+}
+
+# Loop through each comparison
+results <- de_results_tibble
+
+# Store plot objects in a list
+plot_list <- list()
+
+for (i in seq_len(nrow(results))) {
+  comparison_name <- results$Comparison[i]
+  de_results_sample <- results$Results[[i]]
+  output_dir <- GSEA_sample_dir_significant
+  
+  # run_fgsea_save_results(de_results_sample, comparison_name, output_dir)
+  plot_list[[comparison_name]] <- run_fgsea_save_results(de_results_sample, comparison_name, output_dir)
+}
+
+# Assuming 4x4 grid for 16 plots
+combined_plot <- wrap_plots(plot_list, ncol = 4)
+ggsave(filename = paste0(GSEA_sample_dir_significant, "/combined_GSEA_plots.pdf"), 
+       plot = combined_plot, width = 30, height = 20)
+```
+
+```{r}
+GSEA_sample_dir_pos_neg <- paste0(Task5.3.2_GSEA_Hallmark_results, "/pos_and_neg_top_pathways")
+
+if(!dir.exists(paste0(GSEA_sample_dir_pos_neg, "/res_data"))) {
+  dir.create(paste0(GSEA_sample_dir_pos_neg, "/res_data"), recursive = TRUE)
+}
+
+if(!dir.exists(paste0(GSEA_sample_dir_pos_neg, "/plot_data"))) {
+  dir.create(paste0(GSEA_sample_dir_pos_neg, "/plot_data"), recursive = TRUE)
+}
+
+if(!dir.exists(paste0(GSEA_sample_dir_pos_neg, "/Plots"))) {
+  dir.create(paste0(GSEA_sample_dir_pos_neg, "/Plots"), recursive = TRUE)
+}
+```
+
+```{r}
+# Select the top pathways that are enriched in Mock and CAR, respectively:
+
+# Prepare Hallmark gene sets for fgsea
+prepareGeneSets <- function() {
+  msigdbr.Hallmark.df <- msigdbr(species = "Homo sapiens", category = "H")
+  fgsea_hallmark_sets <- msigdbr.Hallmark.df %>% 
+    split(x = .$gene_symbol, f = .$gs_name)
+  return(fgsea_hallmark_sets)
+}
+
+# Perform fgsea and handle results
+run_fgsea_save_results <- function(de_results, comparison_name, output_dir) {
+  # Generate ranks for fgsea
+  markers_to_rank <- as.data.frame(de_results)
+  markers_to_rank$gene_symbol <- rownames(markers_to_rank)
+  
+  ranks <- markers_to_rank %>%
+    dplyr::select(gene_symbol, avg_log2FC) %>%
+    arrange(desc(avg_log2FC)) %>%
+    deframe()
+
+  # Run fgsea
+  fgseaRes <- fgsea(prepareGeneSets(), stats = ranks)
+  
+  # Process and save results
+  fgseaResTidy <- fgseaRes %>%
+    mutate(abbrev_pathway = abbreviate(pathway)) |> 
+    relocate(abbrev_pathway, .after = pathway) |> 
+    as_tibble() %>%
+    arrange(desc(NES))
+  
+  write_csv(fgseaResTidy, file = paste0(output_dir, "/res_data/GSEA_HALLMARK_", comparison_name, ".csv"))
+  
+  # Output plots
+  output_plotData(fgseaResTidy, comparison_name, output_dir)
+}
+
+# Output plots and summary tables
+output_plotData <- function(fgseaResTidy, comparison_name, output_dir) {
+  # only plot the top 40 pathways
+  fgseaResTidy %>%
+    mutate(NES2 = ifelse(NES > 0, "Enriched in Diagnosis", "Enriched in Relapse")) %>%
+    group_by(NES2) %>%
+    arrange(pval) %>%
+    slice_head(n = 10) %>%
+    ungroup() %>%
+    bind_rows() %>%
+    arrange(desc(NES)) -> GSEA.plot.data.pos_and_neg
+  
+  GSEA.plot.data.pos_and_neg %>%
+    mutate(Lead_size = as.integer(map(leadingEdge, length))) %>%
+    mutate(Lead_Genes = as.character(map(leadingEdge, paste0, collapse = ","))) %>%
+    dplyr::select(-c(leadingEdge, NES2, size)) %>% 
+    write_csv(file = paste0(output_dir, "/plot_data/GSEA_HALLMARK_Plot_data_", comparison_name, ".csv"))
+
+  # Column Plot
+  cols = c("Enriched in Diagnosis" = "green", "Enriched in Relapse" = "red")
+  
+  p <- GSEA.plot.data.pos_and_neg %>%
+    ggplot(aes(fct_reorder(pathway, NES), NES)) +
+    geom_col(aes(fill = NES2)) +
+    # scale_fill_manual("NES", values = cols) +
+    scale_fill_manual("NES", values = cols, breaks = c("Enriched in Diagnosis", "Enriched in Relapse")) +
+    coord_flip() + 
+    theme(axis.text.y = element_text(size = 6)) +
+    labs(x = "Pathway", y = "Normalized Enrichment Score", title = comparison_name)
+  ggsave(filename = paste0(output_dir, "/Plots/GSEA_HALLMARK_", comparison_name, ".pdf"))
+  
+  return(p)
+}
+
+# Loop through each comparison
+results <- de_results_tibble
+
+plot_list <- list()
+
+for (i in seq_len(nrow(results))) {
+  comparison_name <- results$Comparison[i]
+  de_results_sample <- results$Results[[i]]
+  output_dir <- GSEA_sample_dir_pos_neg
+  
+  plot_list[[comparison_name]] <- run_fgsea_save_results(de_results_sample, comparison_name, output_dir)
+}
+
+# Assuming 4x4 grid for 16 plots
+combined_plot <- wrap_plots(plot_list, ncol = 4)
+ggsave(filename = paste0(GSEA_sample_dir_pos_neg, "/combined_GSEA_plots.pdf"), 
+       plot = combined_plot, width = 30, height = 20)
+```
+
+### Task 5.3.3 Enrichment Plots:
+
+```{r}
+Task5.3.3_Enrichment_Plots <- paste0(Task5.3_GSEA_Hallmark, "/Task5.3.3_Enrichment_Plots")
+  
+if(!exists(Task5.3.3_Enrichment_Plots)){
+  dir.create(Task5.3.3_Enrichment_Plots)
+}
+```
+
+```{r}
+# Iterate over each pathway in all_pathways
+for (pathway_name in names(all_pathways)) {
+  # Define sub-directory for each pathway
+  pathway_dir <- file.path(Task5.3.3_Enrichment_Plots, pathway_name)
+  if (!dir.exists(pathway_dir)) {
+    dir.create(pathway_dir)
+  }
+  
+  plot_list <- list()
+  
+  # Iterate over each comparison in the de_results_tibble
+  for (i in seq_along(de_results_tibble$Comparison)) {
+    comparison_name <- de_results_tibble$Comparison[i]
+    markers_to_rank <- de_results_tibble$Results[[i]]
+    
+    # Prepare the ranks
+    markers_to_rank$gene_symbol <- rownames(markers_to_rank)
+    ranks <- markers_to_rank %>%
+      select(gene_symbol, avg_log2FC) %>%
+      arrange(desc(avg_log2FC)) %>%
+      deframe()
+    
+    # Run fgsea
+    pathway_genes <- setNames(all_pathways[[pathway_name]], all_pathways[[pathway_name]])
+    fgseaRes <- fgsea(pathways = list(pathway_name = pathway_genes), stats = ranks)
+    
+    # Plot enrichment
+    plot <- plotEnrichment(pathway_genes, ranks) +
+      labs(title = paste(pathway_name, ":", comparison_name)) +
+      annotate("text", x = -Inf, y = -Inf, hjust = 0, vjust = -0.3, label = "Enriched in Diagnosis") +
+      annotate("text", x = Inf, y = -Inf, hjust = 1, vjust = -0.3, label = "Enriched in Relapse")
+    
+    # Save plot to specific pathway folder
+    ggsave(filename = file.path(pathway_dir, paste0("plotEnrichment_", comparison_name, ".pdf")),
+           plot = plot, width = 8, height = 6, units = "in")
+    
+    plot_list[[comparison_name]] <- plot
+  }
+  
+  # Combine all plots for the pathway into a single PDF (if needed)
+  combined_plot <- patchwork::wrap_plots(plot_list, ncol = 4)
+  ggsave(filename = file.path(pathway_dir, "combined_Enrichment_plots.pdf"),
+         plot = combined_plot, width = 35, height = 25, units = "in")
+}
+```
+
+# 6. Run inferCNV on Diagnosis and Relapse for each sample
+
+```{r}
+Task6_inferCNV = paste0(folder.name, "/Task6_inferCNV")
+
+if(!exists(Task6_inferCNV)){
+  dir.create(Task6_inferCNV, recursive = TRUE)
+}
+```
+
+```{r}
+# See folder Task6_inferCNV
+```
+
+```{r}
+unique(Combined.Object@meta.data$new_labels)
+```
+
+
+
+
+
+
+# **??Github - Installation
+
+```{r}
+# # install dependencies
+# BiocManager::install(c("AUCell", "doMC"))
+# devtools::install_github("jaredhuling/jcolors") # dependency that is no longer on CRAN
+# # install BoneMarrowMap package
+# devtools::install_github('andygxzeng/BoneMarrowMap')
+```
+
+# Reference 
+
+## Download reference object and UMAP model
+
+```{r}
+# Set directory to store projection reference files
+projection_path = folder.name
+
+# # Download Bone Marrow Reference - 344 Mb
+# curl::curl_download('https://bonemarrowmap.s3.us-east-2.amazonaws.com/BoneMarrow_RefMap_SymphonyRef.rds', 
+#                     destfile = paste0(projection_path, '/BoneMarrow_RefMap_SymphonyRef.rds'))
+# 
+# # Download uwot model file - 221 Mb
+# curl::curl_download('https://bonemarrowmap.s3.us-east-2.amazonaws.com/BoneMarrow_RefMap_uwot_model.uwot', 
+#                     destfile = paste0(projection_path, '/BoneMarrow_RefMap_uwot_model.uwot'))
+
+# Load Symphony reference
+ref <- readRDS(paste0(projection_path, '/BoneMarrow_RefMap_SymphonyRef.rds'))
+# Set uwot path for UMAP projection
+ref$save_uwot_path <- paste0(projection_path, '/BoneMarrow_RefMap_uwot_model.uwot')
+```
+
+## Visualize Bone Marrow Reference
+
+```{r}
+# If we want to visualize celltype labels or metadata from the BM Reference, we can create a Seurat Object from the symphony reference This will be memory efficient as it will not include gene expression counts, only the UMAP coordinates and the metadata including cell labels and sorting information
+
+ReferenceSeuratObj <- create_ReferenceObject(ref)
+
+# Generate the plot
+ref_umap <- DimPlot(ReferenceSeuratObj, reduction = 'umap', group.by = 'CellType_Annotation_formatted', raster=FALSE, label=TRUE, label.size = 2)
+
+ref_umap <- ref_umap + theme(legend.text = element_text(size = 6))
+ref_umap
+
+filename <- "ref_UMAP_Plot.pdf"
+path <- paste0(folder.name)
+# Save the plot
+ggsave(filename = file.path(path, filename), plot = ref_umap, width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+# We can visualize other annotations too, including cell cycle phase and lineage pseudotime estimates.
+
+p1 <- DimPlot(ReferenceSeuratObj, reduction = 'umap', group.by = 'CyclePhase', raster=FALSE)
+p2 <- FeaturePlot(ReferenceSeuratObj, reduction = 'umap', features = 'Pseudotime', raster=FALSE) 
+
+p1 + p2
+```
+
+# Load Query Seurat object
+
+## Example Seurat
+
+### Download example query data and load
+
+```{r}
+# # Load example data from Roy et al - 141 Mb
+# curl::curl_download('https://bonemarrowmap.s3.us-east-2.amazonaws.com/ExampleQuery_Roy2021.rds',
+#                     destfile = paste0(projection_path, '/ExampleQuery_Roy2021.rds'))
+
+# Load seurat object
+exampleQuery <- readRDS(paste0(projection_path, '/ExampleQuery_Roy2021.rds'))
+exampleQuery
+```
+
+```{r}
+exampleQuery@assays
+```
+
+```{r}
+exampleQuery@meta.data
+```
+
+### Map Query data and evaluate mapping QC metrics (< 1min)
+
+```{r}
+# Provide raw counts, metadata, and donor key. This should take <1 min Calculate mapping error and perform QC to remove low quality cells with high mapping error
+
+# batch variable to correct in the query data, set as NULL if no batches in query
+batchvar <- 'sampleID'
+
+# Map query dataset using Symphony (Kang et al 2021)
+exampleQuery <- map_Query(
+    exp_query = exampleQuery@assays$RNA@counts, 
+    metadata_query = exampleQuery@meta.data,
+    ref_obj = ref,
+    vars = batchvar
+)
+```
+
+```{r}
+# Now that the data is mapped, we will evaluate the mapping QC metrics and flag cells with high mapping errors.
+# Run QC based on mapping error score, flag cells with mapping error >= 2.5 MADs above median.
+exampleQuery <- exampleQuery %>% calculate_MappingError(., reference = ref, MAD_threshold = 2.5) 
+plot_MappingErrorQC(exampleQuery)
+
+# This important step identifies a subset of cells with high mapping error from the query dataset that are either:
+# not present within the reference, or
+# have poor QC metrics (low RNA counts and low transcriptional diversity)
+# Sometimes, low quality cells may erroneously map to the orthochromatic erythroblast region as this cell type has very low transcriptional diversity. These low quality query cells do not have hemoglobin expression and are in fact mis-mapped; they will be flagged by the QC filter and excluded from cell type assignments.
+
+# Please adjust the MAD_threshold (typically between 1 and 3) based on the distribution of your dataset to identify the outliers with low quality and high mapping error scores. This will improve your classifications and any downstream composition analysis
+```
+
+```{r}
+# # Optional step - remove outliers with high mapping error
+# query <- subset(query, mapping_error_QC == 'Pass')
+
+# Optionally, outlier cells with high mapping error can also be removed at this stage. For ease of integrating these mapped annotations with the rest of your analysis, we also choose to skip this step. If so, Final CellType and Pseudotime predictions will be assigned as NA for cells failing the mapping error QC threshold.
+```
+
+###Cell Type Assignments
+
+```{r}
+# We will next use a KNN classifier to assign cell identity based on the 30 K-Nearest Neighbours from the reference map. This label transfer step will take longer, potentially around 10 minutes for ~10,000 cells
+
+# Predict Hematopoietic Cell Types by KNN classification
+exampleQuery <- predict_CellTypes(
+  query_obj = exampleQuery, 
+  ref_obj = ref, 
+  initial_label = 'initial_CellType', # celltype assignments before filtering on mapping QC
+  final_label = 'predicted_CellType'  # celltype assignments with map QC failing cells assigned as NA
+) 
+```
+
+```{r}
+exampleQuery@assays
+exampleQuery@meta.data
+```
+
+```{r}
+ex_cell_type_umap <- DimPlot(subset(exampleQuery, mapping_error_QC == 'Pass'), reduction = 'umap', group.by = c('predicted_CellType'), raster=FALSE, label=TRUE, label.size = 2)
+
+ex_cell_type_umap <- ex_cell_type_umap + theme(legend.text = element_text(size = 6))
+ex_cell_type_umap
+
+# filename <- "ref_UMAP_Plot.pdf"
+# path <- paste0(folder.name)
+# # Save the plot
+# ggsave(filename = file.path(path, filename), plot = ref_umap, width = 10, height = 8, dpi = 300)
+```
+
+### Pseudotime Annotations
+
+```{r}
+# We can also annotate each query cell based on their position along hematopoietic pseudotime. Query cells will be assigned a pseudotime score based on the 30 K-Nearest Neighbours from the reference map. Since our Pseudotime KNN assignments are performed in UMAP space (more accurate than KNN on harmony components), this step is very fast (< 10s)
+
+# Predict Pseudotime values by KNN
+exampleQuery <- predict_Pseudotime(
+  query_obj = exampleQuery, 
+  ref_obj = ref, 
+  initial_label = 'initial_Pseudotime',  # pseudotime assignments before filtering on mapping QC
+  final_label = 'predicted_Pseudotime'   # pseudotime assignments with map QC failing cells assigned as NA
+)
+
+# Visualize Hematopoietic Pseudotime in query data
+FeaturePlot(subset(exampleQuery, mapping_error_QC == 'Pass'), features = c('predicted_Pseudotime'))
+```
+
+### Save projection results
+
+```{r}
+# This will save a csv file with the mapped annotations for each cell (mapping error scores, umap coordinates, predicted Cell Type, and predicted Pseudotime)
+
+# Save CellType Annotations and Projected UMAP coordinates
+save_ProjectionResults(
+  query_obj = exampleQuery, 
+  celltype_label = 'predicted_CellType', 
+  celltype_KNNprob_label = 'predicted_CellType_prob', 
+  pseudotime_label = 'predicted_Pseudotime', 
+  file_name = 'example_querydata_projected_labeled.csv')
+```
+
+### Visualize Projection Density
+
+```{r}
+# Now let’s visualize the density distribution of query cells across the hematopoietic hierarchy
+
+# Set batch/condition to be visualized individually
+batch_key <- 'sampleID'
+
+# returns a list of plots for each donor from a pre-specified batch variable
+projection_plots <- plot_Projection_byDonor(
+  query_obj = exampleQuery, 
+  batch_key = batch_key, 
+  ref_obj = ref, 
+  Hierarchy_only = FALSE, # Whether to exclude T/NK/Plasma/Stromal cells 
+  downsample_reference = TRUE, 
+  downsample_frac = 0.25,   # down-sample reference cells to 25%; reduces figure file size
+  query_point_size = 0.2,   # adjust size of query cells based on # of cells
+  saveplot = TRUE, 
+  save_folder = 'projectionFigures/'
+)
+
+# show plots together with patchwork. Can also just call "projection_plots" object to display one-by-one
+patchwork::wrap_plots(projection_plots, ncol = 2)
+```
+
+```{r}
+# We can also set Hierarchy_only = TRUE to remove T/NK/Plasma/Stromal cells and focus solely on the hematopoietic hierarchy.
+
+# Set batch/condition to be visualized individually
+batch_key <- 'sampleID'
+
+# returns a list of plots for each donor from a pre-specified batch variable
+projection_plots <- plot_Projection_byDonor(
+  query_obj = exampleQuery, 
+  batch_key = batch_key, 
+  ref_obj = ref, 
+  Hierarchy_only = TRUE, # Whether to exclude T/NK/Plasma/Stromal cells 
+  downsample_reference = TRUE, 
+  downsample_frac = 0.25,   # down-sample reference cells to 25%; reduces figure file size
+  query_point_size = 0.2,   # adjust size of query cells based on # of cells
+  saveplot = TRUE, 
+  save_folder = 'projectionFigures/'
+)
+
+# show plots together with patchwork. Can also just call "projection_plots" object to display one-by-one
+patchwork::wrap_plots(projection_plots, ncol = 2)
+```
+
+### Get Composition data for each donor
+
+```{r}
+query_composition <- get_Composition(
+  query_obj = exampleQuery, 
+  donor_key = 'sampleID', 
+  celltype_label = 'predicted_CellType', 
+  mapQC_col = 'mapping_error_QC', 
+  knn_prob_cutoff = NULL, 
+  return_type = 'long')
+
+query_composition
+```
+
+```{r}
+# Or as a wide table with counts of # of cells
+
+query_composition <- get_Composition(
+  query_obj = exampleQuery, 
+  donor_key = 'sampleID', 
+  celltype_label = 'predicted_CellType', 
+  mapQC_col = 'mapping_error_QC', 
+  knn_prob_cutoff = NULL, 
+  return_type = 'count')
+
+query_composition 
+```
+
+```{r}
+# Or as a wide table with proportion of each cell type within each donor
+
+query_composition <- get_Composition(
+  query_obj = exampleQuery, 
+  donor_key = 'sampleID', 
+  celltype_label = 'predicted_CellType', 
+  mapQC_col = 'mapping_error_QC', 
+  knn_prob_cutoff = NULL, 
+  return_type = 'proportion')
+
+query_composition 
+```
+
+```{r}
+# Simple heatmap to visualize composition of projected samples
+p <- query_composition %>% column_to_rownames('sampleID') %>% data.matrix() %>% ComplexHeatmap::Heatmap()
+p
+```
+
+## Loser Seurat Object
+
+```{r}
+Loser.Object <- readRDS(paste0(folder.name, "/Loser.object.SeuratV4.rds"))
+Loser.Object@assays
+Loser.Object@meta.data
+```
+
+### Map Query data and evaluate mapping QC metrics (< 1min)
+
+```{r}
+# Provide raw counts, metadata, and donor key. This should take <1 min Calculate mapping error and perform QC to remove low quality cells with high mapping error
+
+# batch variable to correct in the query data, set as NULL if no batches in query
+batchvar <- 'new_labels'
+
+# Map query dataset using Symphony (Kang et al 2021)
+Loser.Object <- map_Query(
+    exp_query = Loser.Object@assays$RNA@counts, 
+    metadata_query = Loser.Object@meta.data,
+    ref_obj = ref,
+    vars = batchvar
+)
+```
+
+```{r}
+# Now that the data is mapped, we will evaluate the mapping QC metrics and flag cells with high mapping errors.
+# Run QC based on mapping error score, flag cells with mapping error >= 2.5 MADs above median.
+Loser.Object <- Loser.Object %>% calculate_MappingError(., reference = ref, MAD_threshold = 2.5) 
+plot_MappingErrorQC(Loser.Object)
+
+# This important step identifies a subset of cells with high mapping error from the query dataset that are either:
+# not present within the reference, or
+# have poor QC metrics (low RNA counts and low transcriptional diversity)
+# Sometimes, low quality cells may erroneously map to the orthochromatic erythroblast region as this cell type has very low transcriptional diversity. These low quality query cells do not have hemoglobin expression and are in fact mis-mapped; they will be flagged by the QC filter and excluded from cell type assignments.
+
+# Please adjust the MAD_threshold (typically between 1 and 3) based on the distribution of your dataset to identify the outliers with low quality and high mapping error scores. This will improve your classifications and any downstream composition analysis
+```
+
+```{r}
+# # Optional step - remove outliers with high mapping error
+# query <- subset(query, mapping_error_QC == 'Pass')
+
+# Optionally, outlier cells with high mapping error can also be removed at this stage. For ease of integrating these mapped annotations with the rest of your analysis, we also choose to skip this step. If so, Final CellType and Pseudotime predictions will be assigned as NA for cells failing the mapping error QC threshold.
+```
+
+###Cell Type Assignments (10,000 cells in < 10min)
+
+```{r}
+# We will next use a KNN classifier to assign cell identity based on the 30 K-Nearest Neighbours from the reference map. This label transfer step will take longer, potentially around 10 minutes for ~10,000 cells
+
+# Predict Hematopoietic Cell Types by KNN classification
+Loser.Object <- predict_CellTypes(
+  query_obj = Loser.Object, 
+  ref_obj = ref, 
+  initial_label = 'initial_CellType', # celltype assignments before filtering on mapping QC
+  final_label = 'predicted_CellType'  # celltype assignments with map QC failing cells assigned as NA
+) 
+```
+
+```{r}
+Loser.Object@assays
+Loser.Object@meta.data
+```
+
+```{r}
+loser_cell_type_umap <- DimPlot(subset(Loser.Object, mapping_error_QC == 'Pass'), reduction = 'umap', group.by = c('predicted_CellType'), raster=FALSE, label=TRUE, label.size = 2)
+
+loser_cell_type_umap <- loser_cell_type_umap + theme(legend.text = element_text(size = 6))
+loser_cell_type_umap
+
+filename <- "Loser_UMAP_Plot.pdf"
+path <- paste0(folder.name)
+# Save the plot
+ggsave(filename = file.path(path, filename), plot = loser_cell_type_umap, width = 12, height = 8, dpi = 300)
+```
+
+### Pseudotime Annotations
+
+```{r}
+# We can also annotate each query cell based on their position along hematopoietic pseudotime. Query cells will be assigned a pseudotime score based on the 30 K-Nearest Neighbours from the reference map. Since our Pseudotime KNN assignments are performed in UMAP space (more accurate than KNN on harmony components), this step is very fast (< 10s)
+
+# Predict Pseudotime values by KNN
+Loser.Object <- predict_Pseudotime(
+  query_obj = Loser.Object, 
+  ref_obj = ref, 
+  initial_label = 'initial_Pseudotime',  # pseudotime assignments before filtering on mapping QC
+  final_label = 'predicted_Pseudotime'   # pseudotime assignments with map QC failing cells assigned as NA
+)
+
+# Visualize Hematopoietic Pseudotime in query data
+FeaturePlot(subset(Loser.Object, mapping_error_QC == 'Pass'), features = c('predicted_Pseudotime'))
+```
+
+# Save Point
+
+```{r}
+saveRDS(Loser.Object, file = paste0(folder.name, "/Loser.object.w_projection.rds"))
+```
+
+```{r}
+Loser.Object <- readRDS(paste0(folder.name, "/Loser.object.w_projection.rds"))
+```
+
+```{r}
+# This will save a csv file with the mapped annotations for each cell (mapping error scores, umap coordinates, predicted Cell Type, and predicted Pseudotime)
+
+# Save CellType Annotations and Projected UMAP coordinates
+save_ProjectionResults(
+  query_obj = Loser.Object, 
+  celltype_label = 'predicted_CellType', 
+  celltype_KNNprob_label = 'predicted_CellType_prob', 
+  pseudotime_label = 'predicted_Pseudotime', 
+  file_name = './Loser_querydata_projected_labeled.csv')
+```
+
+### Visualize Projection Density
+
+```{r}
+# Now let’s visualize the density distribution of query cells across the hematopoietic hierarchy
+
+# Set batch/condition to be visualized individually
+batch_key <- 'new_labels'
+
+# returns a list of plots for each donor from a pre-specified batch variable
+projection_plots <- plot_Projection_byDonor(
+  query_obj = Loser.Object, 
+  batch_key = batch_key, 
+  ref_obj = ref, 
+  Hierarchy_only = FALSE, # Whether to exclude T/NK/Plasma/Stromal cells 
+  downsample_reference = TRUE, 
+  downsample_frac = 0.25,   # down-sample reference cells to 25%; reduces figure file size
+  query_point_size = 0.2,   # adjust size of query cells based on # of cells
+  saveplot = TRUE, 
+  save_folder = './2024_05_17_Github_cell_anchoring/projectionFigures/'
+)
+
+# show plots together with patchwork. Can also just call "projection_plots" object to display one-by-one
+patchwork::wrap_plots(projection_plots, ncol = 2)
+```
+
+```{r}
+# We can also set Hierarchy_only = TRUE to remove T/NK/Plasma/Stromal cells and focus solely on the hematopoietic hierarchy.
+
+# Set batch/condition to be visualized individually
+batch_key <- 'new_labels'
+
+# returns a list of plots for each donor from a pre-specified batch variable
+projection_plots <- plot_Projection_byDonor(
+  query_obj = Loser.Object, 
+  batch_key = batch_key, 
+  ref_obj = ref, 
+  Hierarchy_only = TRUE, # Whether to exclude T/NK/Plasma/Stromal cells 
+  downsample_reference = TRUE, 
+  downsample_frac = 0.25,   # down-sample reference cells to 25%; reduces figure file size
+  query_point_size = 0.2,   # adjust size of query cells based on # of cells
+  saveplot = TRUE, 
+  save_folder = './2024_05_17_Github_cell_anchoring/projectionFigures/'
+)
+
+# show plots together with patchwork. Can also just call "projection_plots" object to display one-by-one
+patchwork::wrap_plots(projection_plots, ncol = 2)
+```
+
+### Get Composition data for each donor
+
+```{r}
+query_composition <- get_Composition(
+  query_obj = Loser.Object, 
+  donor_key = 'new_labels', 
+  celltype_label = 'predicted_CellType', 
+  mapQC_col = 'mapping_error_QC', 
+  knn_prob_cutoff = NULL, 
+  return_type = 'long')
+
+query_composition
+```
+
+```{r}
+# Or as a wide table with counts of # of cells
+
+query_composition <- get_Composition(
+  query_obj = Loser.Object, 
+  donor_key = 'new_labels', 
+  celltype_label = 'predicted_CellType', 
+  mapQC_col = 'mapping_error_QC', 
+  knn_prob_cutoff = NULL, 
+  return_type = 'count')
+
+query_composition 
+```
+
+```{r}
+# Or as a wide table with proportion of each cell type within each donor
+
+query_composition <- get_Composition(
+  query_obj = Loser.Object, 
+  donor_key = 'new_labels', 
+  celltype_label = 'predicted_CellType', 
+  mapQC_col = 'mapping_error_QC', 
+  knn_prob_cutoff = NULL, 
+  return_type = 'proportion')
+
+query_composition 
+```
+
+```{r}
+# Simple heatmap to visualize composition of projected samples
+heatmap_plot <- query_composition %>% 
+  column_to_rownames('new_labels') %>% 
+  data.matrix() %>% 
+  Heatmap(name = "Loser Samples Composition", 
+          row_names_gp = gpar(fontsize = 8),
+          column_names_gp = gpar(fontsize = 8)) 
+
+heatmap_plot
+
+pdf(paste0(folder.name, "/Loser_composition_heatmap.pdf"), width = 10, height = 6)  
+draw(heatmap_plot)
+dev.off()
+```
+
+# End
+
+
+
+
+
+
+
+
+
+
+
+# Bar Plot
+
+```{r}
+Combined.Object@meta.data
+```
+
+```{r}
+# Showing the proportion of each cell type predicted for each sample (grouped in D and R pairs for each patient)
+
+# Calculate the counts for each cell type within each sample
+cell_type_counts <- Combined.Object@meta.data %>%
+  dplyr::count(new_labels, predicted.id)
+
+# sample_totals <- cell_type_counts %>%
+#   count(new_labels)
+
+# Calculate the total counts for each sample
+sample_totals <- cell_type_counts %>%
+  group_by(new_labels) %>%
+  summarize(total = sum(n), .groups = 'drop')
+
+# Join the totals back to the counts to calculate proportions
+cell_type_proportions <- cell_type_counts %>%
+  left_join(sample_totals, by = "new_labels") %>%
+  mutate(proportion = n / total)
+
+# Generate the bar plot with specified colors
+ggplot(cell_type_proportions, aes(x = new_labels, y = proportion, fill = predicted.id)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.8) +
+  scale_fill_manual(values = id_colors) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = "Sample", y = "Percentage of Total (%)", fill = "Cell Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 75, vjust = 1, hjust=1)) # Adjust angle here
+
+# Render the plot
+ggsave(paste0(folder.name, "/cell_type_proportions.pdf"), width = 10, height = 6, dpi = 300)
+```
