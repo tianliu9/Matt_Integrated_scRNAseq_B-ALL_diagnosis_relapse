@@ -1,0 +1,494 @@
+---
+title: "2024_02_21_Witkowski_FindAllMarkers"
+output: html_document
+date: "2024-02-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import Libraries
+================
+
+```{r}
+script.date = "2024-02-21"
+
+folder.name = "2024_02_21_Witkowski_FindAllMarkers"
+
+if(!exists(folder.name)){
+  dir.create(folder.name)
+}
+
+suppressPackageStartupMessages({
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(AnnotationHub)
+library(AnnotationFilter)
+library(AnnotationDbi)
+library(slingshot)
+library(zellkonverter)
+library(BiocManager)
+library(remotes)
+library(devtools)
+library(R.utils)
+library(SeuratWrappers)
+library(harmony)
+library(ggpubr)
+library(gridExtra)
+library(rlist)
+library(tictoc)
+library(biomaRt)
+library(rio)
+library(readxl)
+library(tradeSeq)
+library(pheatmap)
+library(clustree)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(magrittr)
+library(ggplot2)
+library(tidyseurat)
+library(dittoSeq)
+# library(SingleR)
+library(celldex)
+# library(SeuratData)
+library(skimr)
+# library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(org.Hs.eg.db)
+library(annotables)
+# library(infercnv)
+library(stringr)
+library(plotly)
+library(htmlwidgets)
+library(RColorBrewer)
+library(ensembldb)
+library(multtest)
+library(glmGamPoi)
+# library(metap)
+})
+
+# Rise memory
+options(future.globals.maxSize = 14000 * 1024^2) ## 14 GB (I think ...)
+```
+
+Load Data
+=============
+
+```{r}
+file_path <- "2023_10_19_Witkowski_Integrated_scRNAseq_B-ALL_diagnosis_relapse"
+
+Combined.Object <- readRDS(paste0(file_path, "/Combined.Object.rds"))
+```
+
+Combined UMAP
+==============
+
+PCA
+-------------
+
+```{r}
+# Use standard normalization
+
+DefaultAssay(Combined.Object) <- 'RNA'
+Combined.Object <- NormalizeData(Combined.Object) %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA()
+```
+
+```{r}
+# Determine percent of variation associated with each PC
+pct <- Combined.Object[["pca"]]@stdev / sum(Combined.Object[["pca"]]@stdev) * 100
+# pct
+
+# Calculate cumulative percents for each PC
+cumu <- cumsum(pct)
+# cumu
+
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5
+co1 <- which(cumu > 90 & pct < 5)[1]
+co1
+```
+
+```{r}
+# Identifies the PC where the percent change in variation between consecutive PCs is less than 0.1%
+co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+co2
+```
+
+```{r}
+# Choose the minimum of these two metrics as the PCs covering the majority of the variation in the data.
+pcs <- min(co1, co2)
+pcs
+```
+
+```{r}
+plot_df <- data.frame(pct = pct,
+                      cumu = cumu,
+                      rank = 1:length(pct))
+
+plot_df
+
+ggplot(plot_df, aes(cumu, pct, label = rank, color = rank > pcs)) +
+  geom_text() +
+  # geom_vline(xintercept = 75, color = "grey") +
+  # geom_hline(yintercept = min(pct[pct > 5]), color = "grey") +
+  theme_bw()
+
+```
+
+# FindClusters
+
+```{r}
+UMAP_dir <- paste0(folder.name, "/UMAP_w_resolutions")
+if(!dir.exists(UMAP_dir)) {
+  dir.create(UMAP_dir, recursive = TRUE)
+}
+```
+
+```{r}
+# Define the sequence of resolution values
+resolutions <- seq(0.1, 2, by = 0.1)
+
+# Loop through each resolution value
+for(resolution_value in resolutions) {
+  # Update the Seurat object with the current resolution
+  Combined.Object.UMAP <- Combined.Object %>%
+    FindNeighbors(dims = 1:pcs) %>%
+    FindClusters(method = "igraph", resolution = resolution_value) %>%
+    RunUMAP(dims = 1:40, reduction = "pca", n.components = 3L)
+  
+  # Generate the UMAP plot for the current resolution
+  umap_plot <- DimPlot(Combined.Object.UMAP,
+                       reduction = "umap",
+                       label = TRUE) +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 10),
+          legend.spacing.x = unit(1.5, 'cm'), # Adjust spacing
+          legend.spacing.y = unit(1.5, 'cm'))
+  
+  # Define the filename using the current resolution value
+  filename <- paste0(UMAP_dir, "/UMAP_resolution_", resolution_value, ".pdf")
+  
+  # Save the UMAP plot as a PDF
+  ggsave(filename, 
+         plot = umap_plot, 
+         width = 10,  
+         height = 8)
+}
+
+```
+
+# Find All Markers
+
+## Resolution = 0.1
+
+```{r}
+Combined.Object.UMAP <- Combined.Object %>%
+    FindNeighbors(dims = 1:pcs) %>%
+    FindClusters(method = "igraph", resolution = 0.1) %>%
+    RunUMAP(dims = 1:40, reduction = "pca", n.components = 3L)
+```
+
+```{r}
+Combined.Object.UMAP@meta.data
+```
+
+### Plot Interested Genes on UMAP
+
+```{r}
+gene_names <- rownames(Combined.Object.UMAP[["RNA"]])
+head(gene_names)
+# gene_names.df <- as.data.frame(gene_names)
+```
+
+```{r}
+interest_gene_names <- c(
+"MME",
+"CD19",
+"MS4A1",
+"CD22",
+"HOXA9",
+"FLT3", 
+# "IGHM", # no this gene, maybe "IGHMBP2"?
+"TCF3", 
+"EBF1", 
+"PAX5", 
+"ABL1", 
+"ETV6", 
+"RUNX1", 
+"TP53", 
+"CDKN2A", 
+"CDKN1A", 
+"BCL2", 
+"MCL1"
+)
+```
+
+```{r}
+resolution <- 0.1
+umap_path <- paste0(folder.name, "/gene_UMAP_w_resolution_",resolution)
+if(!exists(umap_path)){
+  dir.create(umap_path)
+}
+
+for (gene in interest_gene_names) {
+  pdf_file_path <- paste0(umap_path, "/", gene, "_UMAP.pdf")
+  
+  # Plot the gene expression on UMAP
+  plot <- FeaturePlot(Combined.Object.UMAP, features = gene, label = TRUE, pt.size = 0.5)
+  
+  ggsave(filename = pdf_file_path, 
+       plot = plot,
+       width = 10,
+       height = 8)
+}
+```
+
+### Find All Markers
+
+```{r}
+DefaultAssay(Combined.Object.UMAP) <- "RNA"
+
+resolution_value = 0.1
+
+Combined.Object.UMAP %>%
+  as_tibble() %>%
+  select_at(vars(contains("RNA_snn_res.0.1"))) %>%
+  pivot_longer(cols = 1,
+               names_to = "Resolution",
+               values_to = "cluster") %>%
+  mutate(cluster = as.numeric(cluster)) %>%
+  group_by(Resolution) %>%
+  summarise(mean = mean(cluster, rm.na = T),
+            max = max(cluster))
+```
+
+```{r}
+Idents(Combined.Object.UMAP) <- "RNA_snn_res.0.1" # name is picked from column name of resolutions
+```
+
+```{r}
+markers = Combined.Object.UMAP %>%
+  FindAllMarkers(.,
+    # identify genes that are uniquely or predominantly expressed in each cluster compared to others
+    only.pos = T,
+    min.pct = 0.25,
+    logfc.threshold = 0.25
+  )
+```
+
+```{r}
+markers %>%
+  dplyr::count(cluster)
+```
+
+### Save Point
+
+```{r}
+saveRDS(markers, file = paste0(folder.name, "/markers_w_resolution_", resolution_value, ".rds"))
+write.csv(markers, file = paste0(folder.name, "/markers_w_resolution_", resolution_value, ".csv"), row.names = FALSE)
+```
+
+```{r}
+markers = readRDS(file = paste0(folder.name, "/markers_w_resolution_", resolution_value, ".rds"))
+```
+
+### Top Markers
+
+```{r}
+# Find top genes for each cluster
+markers %>%
+  group_by(cluster) %>%
+  top_n(10, avg_log2FC) -> top.markers
+```
+
+```{r}
+top.markers
+```
+
+### Save Point
+
+```{r}
+saveRDS(top.markers, file = paste0(folder.name, "/top.markers_w_resolution_", resolution_value, ".rds"))
+write.csv(top.markers, file = paste0(folder.name, "/top.markers_w_resolution_", resolution_value, ".csv"), row.names = FALSE)
+```
+
+```{r}
+top.markers = readRDS(file = paste0(folder.name, "/top.markers_w_resolution_", resolution_value, ".rds"))
+```
+
+### Heatmap
+
+```{r, fig.height=15} 
+# Use fig.height=15 to make the top cell label smaller
+# Change here to adjust plot resolution ...
+
+Combined.Object.UMAP %>%
+  DoHeatmap(
+    features = top.markers$gene)  +
+	  theme(axis.text.y= element_text(size=3), axis.text.x= element_text(size=3)
+  )
+
+ggsave(filename = paste0(folder.name, "/Heatmap_w_resolution_", resolution_value, ".pdf"))
+```
+
+## Resolution = 0.2
+
+```{r}
+Combined.Object.UMAP <- Combined.Object %>%
+    FindNeighbors(dims = 1:pcs) %>%
+    FindClusters(method = "igraph", resolution = 0.2) %>%
+    RunUMAP(dims = 1:40, reduction = "pca", n.components = 3L)
+```
+
+```{r}
+Combined.Object.UMAP@meta.data
+```
+
+```{r}
+DefaultAssay(Combined.Object.UMAP) <- "RNA"
+
+resolution_value = 0.2
+
+Combined.Object.UMAP %>%
+  as_tibble() %>%
+  select_at(vars(contains("RNA_snn_res.0.2"))) %>%
+  pivot_longer(cols = 1,
+               names_to = "Resolution",
+               values_to = "cluster") %>%
+  mutate(cluster = as.numeric(cluster)) %>%
+  group_by(Resolution) %>%
+  summarise(mean = mean(cluster, rm.na = T),
+            max = max(cluster))
+```
+
+```{r}
+Idents(Combined.Object.UMAP) <- "RNA_snn_res.0.2" # name is picked from column name of resolutions
+```
+
+```{r}
+markers = Combined.Object.UMAP %>%
+  FindAllMarkers(.,
+    # identify genes that are uniquely or predominantly expressed in each cluster compared to others
+    only.pos = T,
+    min.pct = 0.25, # Default is 0.1
+    logfc.threshold = 0.25
+  )
+```
+
+```{r}
+markers %>%
+  dplyr::count(cluster)
+```
+
+### Save Point
+
+```{r}
+saveRDS(markers, file = paste0(folder.name, "/markers_w_resolution_", resolution_value, ".rds"))
+
+write.csv(markers, file = paste0(folder.name, "/markers_w_resolution_", resolution_value, ".csv"), row.names = FALSE)
+```
+
+```{r}
+markers = readRDS(file = paste0(folder.name, "/markers_w_resolution_", resolution_value, ".rds"))
+```
+
+### Top Markers
+
+```{r}
+# Find top genes for each cluster
+markers %>%
+  group_by(cluster) %>%
+  top_n(10, avg_log2FC) -> top.markers
+```
+
+```{r}
+top.markers
+```
+
+### Save Point
+
+```{r}
+saveRDS(top.markers, file = paste0(folder.name, "/top.markers_w_resolution_", resolution_value, ".rds"))
+write.csv(top.markers, file = paste0(folder.name, "/top.markers_w_resolution_", resolution_value, ".csv"), row.names = FALSE)
+```
+
+```{r}
+top.markers = readRDS(file = paste0(folder.name, "/top.markers_w_resolution_", resolution_value, ".rds"))
+```
+
+### Heatmap
+
+```{r, fig.height=15} 
+# Use fig.height=15 to make the top cell label smaller
+# Change here to adjust plot resolution ...
+
+Combined.Object.UMAP %>%
+  DoHeatmap(
+    features = top.markers$gene)  +
+	  theme(axis.text.y= element_text(size=3), axis.text.x= element_text(size=3)
+  )
+
+ggsave(filename = paste0(folder.name, "/Heatmap_w_resolution_", resolution_value, ".pdf"))
+```
+
+### Plot Interested Genes on UMAP
+
+```{r}
+gene_names <- rownames(Combined.Object.UMAP[["RNA"]])
+head(gene_names)
+# gene_names.df <- as.data.frame(gene_names)
+```
+
+```{r}
+interest_gene_names <- c(
+"MME",
+"CD19",
+"MS4A1",
+"CD22",
+"HOXA9",
+"FLT3", 
+# "IGHM", # no this gene, maybe "IGHMBP2"?
+"TCF3", 
+"EBF1", 
+"PAX5", 
+"ABL1", 
+"ETV6", 
+"RUNX1", 
+"TP53", 
+"CDKN2A", 
+"CDKN1A", 
+"BCL2", 
+"MCL1"
+)
+```
+
+```{r}
+resolution <- 0.2
+umap_path <- paste0(folder.name, "/gene_UMAP_w_resolution_",resolution)
+if(!exists(umap_path)){
+  dir.create(umap_path)
+}
+
+for (gene in interest_gene_names) {
+  pdf_file_path <- paste0(umap_path, "/", gene, "_UMAP.pdf")
+  
+  # Plot the gene expression on UMAP
+  plot <- FeaturePlot(Combined.Object.UMAP, features = gene, label = TRUE, pt.size = 0.5)
+  
+  ggsave(filename = pdf_file_path, 
+       plot = plot,
+       width = 10,
+       height = 8)
+}
+```
