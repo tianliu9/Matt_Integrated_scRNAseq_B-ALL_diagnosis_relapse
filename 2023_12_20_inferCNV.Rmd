@@ -1,0 +1,220 @@
+---
+title: "2023_12_20_inferCNV"
+output: html_document
+date: "2023-12-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import Libraries
+================
+
+
+```{r}
+script.date = "2023-12-20"
+
+folder.name = "2023_12_20_inferCNV"
+
+if(!exists(folder.name)){
+  dir.create(folder.name)
+}
+
+library(Seurat)
+library(tidyverse)
+library(tidyseurat)
+library(annotables)
+library(infercnv)
+library(tictoc)
+```
+
+Load the Data
+=============
+
+```{r}
+# Load the saved Seurat object
+Loser.Object <- readRDS(paste0("2023_10_19_Witkowski_Integrated_scRNAseq_B-ALL_diagnosis_relapse", "/Loser.Object.SeuratV4.rds"))
+```
+
+```{r}
+Loser.Object@meta.data
+```
+
+```{r}
+metadata <- Loser.Object@meta.data
+
+# Extract the last part of the string of `orig.ident`
+metadata$status <- sapply(strsplit(metadata$orig.ident, "_"), function(x) tail(x, n = 1))
+
+column_order <- c("orig.ident", "status", setdiff(names(metadata), c("orig.ident", "status")))
+metadata <- metadata[, column_order]
+
+# Assign the modified metadata back to the Seurat object
+Loser.Object@meta.data <- metadata
+```
+
+```{r}
+Loser.Object@meta.data
+```
+
+```{r}
+Loser.Object@meta.data %>% 
+  dplyr::count(orig.ident)
+```
+
+InferCNV
+========
+
+Set Parameters
+---------------
+
+```{r}
+sample.name = "ETV001_NYU_DIAGNOSIS"
+anno.file = paste0("iCNV_", sample.name, ".annotation.txt")
+geneOrder.file = paste0("iCNV_", sample.name, ".GeneOrder.txt")
+
+Output.folder = paste0(folder.name, "/", sample.name)
+```
+
+```{r}
+if(!exists(Output.folder)){
+  dir.create(Output.folder)
+}
+```
+
+Subset Prog_Dig_Relap
+--------------
+
+### meta: label cell
+
+```{r}
+## Extract specific "orig.ident" ... 
+Idents(Loser.Object) <- "orig.ident"
+Loser.OneSample.object = subset(Loser.Object, idents = c(sample.name)) ## CHANGE ONE PLACE
+
+## Remove space in cell type names
+## Place "Relapse" and "Diagnosis" after cell type
+Loser.OneSample.object@meta.data %>% 
+  ## Remove "space" in "Prog_B 1" and "Prog_B 2"
+  mutate(predicted.id = str_remove(predicted.id, " ")) %>% 
+  mutate(predicted.id = str_remove(predicted.id, "_")) %>% 
+  # dplyr::count(predicted.id) %>% 
+  ## Label "CD4 Naive", "CD14 Mono", "CD4 Memory", "CD8 Naive" as "Normal"
+  # mutate(iCNV_label = case_when(
+  #   predicted.id %in% c("CD4Naive", "CD14Mono", "CD4Memory", "CD8Naive") ~ "normal",
+  # )) %>% 
+  ## Place "donor#" in each Prog_B1 and Prog_B2 cells 
+  mutate(iCNV_label = str_c(predicted.id, status, sep = "_")) %>% 
+  # mutate(iCNV_label = ifelse(is.na(iCNV_label), str_c(predicted.id, status, sep = "_"), iCNV_label)) %>% 
+  relocate(predicted.id, iCNV_label, .after = orig.ident) -> new.metadata
+Loser.OneSample.object@meta.data = new.metadata
+
+Loser.OneSample.object@meta.data %>% 
+  dplyr::count(iCNV_label) %>% 
+  dplyr::filter(n > 10) %>%
+  pull(iCNV_label) -> Celltype.morethan.one
+
+```
+
+
+```{r}
+
+Idents(Loser.OneSample.object) <- "iCNV_label"
+Loser.OneSample.object = subset(Loser.OneSample.object, idents = Celltype.morethan.one)
+
+Loser.OneSample.object@meta.data %>% 
+  dplyr::count(iCNV_label)
+
+```
+
+```{r}
+Loser.OneSample.object@meta.data %>% 
+  dplyr::count(orig.ident)
+```
+
+```{r}
+grch38 %>% 
+  dplyr::filter(chr %in% c(1:22, "X", "Y")) %>% 
+  dplyr::filter(symbol %in% rownames(Loser.OneSample.object)) %>% 
+  pull(symbol) -> gene.w.position
+
+gene.w.position = unique(gene.w.position)
+
+subset.matrix <- Loser.OneSample.object@assays$RNA@counts[gene.w.position, ] # Pull the raw expression matrix from the original Seurat object containing only the genes of interest
+object2 <- CreateSeuratObject(counts = subset.matrix) # Create a new Seurat object with just the genes of interest
+orig.ident <- Loser.OneSample.object@meta.data # Pull the identities from the original Seurat object as a data.frame
+object2 <- AddMetaData(object = object2, metadata = orig.ident) # Add the idents to the meta.data slot
+```
+
+
+Generate InferCNV inputs
+-------------------------
+
+```{r}
+### Raw matrix
+
+## Replace by "object2" sparse matrix ...
+iCNV.count.matrix = object2@assays$RNA@counts
+dim(iCNV.count.matrix)
+# iCNV.count.matrix = data.frame(object2@assays$RNA@counts)
+# dim(iCNV.count.matrix)
+# write.table(iCNV.count.matrix, file = "Matt.iCNV.ProgB.count.matrix.txt", sep = "\t")
+# head(iCNV.count.matrix)
+
+
+### Annotaiton
+
+iCNV.annotion = object2@meta.data %>% 
+  rownames_to_column(., var = "cellID") %>% 
+  dplyr::select(cellID, iCNV_label)
+  # mutate(cellID = str_replace(cellID, "-", "."))
+dim(iCNV.annotion)
+write.table(iCNV.annotion, file = anno.file, sep = "\t", col.names = F, row.names = F)
+# iCNV.annotion[1:4,1:2]
+iCNV.annotion %>% 
+  dplyr::count(iCNV_label)
+
+### Gene order
+grch38 %>% 
+  dplyr::filter(chr %in% c(1:23, "X", "Y")) %>% 
+  dplyr::filter(symbol %in% rownames(object2)) %>% 
+  dplyr::select(symbol, chr, start, end) %>% 
+  distinct(symbol, .keep_all = T) %>% 
+  arrange(chr) %>% 
+  mutate(chr = str_c("chr", chr)) -> iCNV.gene.order
+## Remove duplicates
+tail(iCNV.gene.order, 1000)
+dim(iCNV.gene.order)
+write.table(iCNV.gene.order, file = geneOrder.file, sep = "\t", col.names = F, row.names = F)
+```
+
+Run inferCNV on R
+==================
+
+
+```{r}
+infercnv_obj = CreateInfercnvObject(raw_counts_matrix=iCNV.count.matrix,
+                                    annotations_file = anno.file,
+                                    delim="\t",
+                                    gene_order_file= geneOrder.file,
+                                    ref_group_names = NULL) 
+
+
+```
+
+```{r}
+# This data used 10x Genomics
+tic()
+options(scipen = 100)
+infercnv_obj = infercnv::run(infercnv_obj,
+                             cutoff=0.1, # cutoff=1 works well for Smart-seq2, and cutoff=0.1 works well for 10x Genomics
+                             out_dir=Output.folder, 
+                             cluster_by_groups=TRUE, 
+                             denoise=TRUE,
+                             num_threads = 2,
+                             HMM=TRUE)
+toc()
+```
+
+
